@@ -14,12 +14,19 @@ extern "C" {
 
 typedef struct systemone systemone;
 
+// what a model is loaded for
+typedef enum systemone_model {
+    SYSTEMONE_MODEL_DECISION = 0, // typed questions in, probabilities out: systemone_decide() (default)
+    SYSTEMONE_MODEL_CHAT     = 1, // text generation with the chat template of the model: systemone_chat()
+} systemone_model;
+
 typedef struct systemone_params {
     int32_t n_gpu_layers;   // layers on the GPU, 0 = CPU only, -1 = all
-    uint32_t n_ctx;         // longest prompt in tokens (state + question + options); 0 = 4096
+    uint32_t n_ctx;         // longest prompt in tokens (state + question + options, or chat + reply); 0 = 4096
     int32_t n_threads;      // CPU threads; 0 = hardware default
     bool verbose;           // llama.cpp logs to stderr
     bool repack;            // CPU weight repacking: faster kernels, but the weights are held twice in RAM (default true)
+    systemone_model model;  // SYSTEMONE_MODEL_DECISION (default) or SYSTEMONE_MODEL_CHAT
 } systemone_params;
 
 systemone_params systemone_default_params(void);
@@ -29,17 +36,27 @@ systemone_params systemone_default_params(void);
 systemone * systemone_load(const char * model_path, const systemone_params * params);
 void systemone_free(systemone * so);
 
-// The decision model family llama.cpp detected, e.g. "lfm3_d1", "openjev"; "none" for a model that is not one.
+// The decision model family llama.cpp detected, e.g. "lfm3_d1", "openjev"; "none" for a model that is not one;
+// "chat" for a model loaded with SYSTEMONE_MODEL_CHAT.
 const char * systemone_model_type(const systemone * so);
 
 // Answers one request. Returns a malloc'd JSON string: {"model", "answers", "usage"} as the server, or
 // {"error": {"message", "type"}}. Free it with systemone_free_string(). NULL only if out of memory.
 // Safe to call from several threads on the same handle: requests run one at a time.
 char * systemone_decide(systemone * so, const char * request_json);
+
+// Chat mode: the reply to a conversation. The request is {"messages": [{"role", "content"}, ...]} in the OpenAI
+// format, with optional "max_tokens" (256), "temperature" (0.8, 0 = greedy), "top_k" (40), "top_p" (0.95),
+// "min_p" (0.05) and "seed". Returns a malloc'd JSON string: {"model", "message": {"role", "content"},
+// "finish_reason": "stop" or "length", "usage", "timings"}, or {"error": ...}. Free it with systemone_free_string().
+// Control-token texts in the messages (e.g. "<|im_start|>") are broken with a zero-width space, so a message
+// cannot open a turn of its own. Same threading and NULL rules as systemone_decide().
+char * systemone_chat(systemone * so, const char * request_json);
+
 void systemone_free_string(char * s);
 
-// The error JSON of the last systemone_decide() on this handle, "" if it succeeded. The pointer is
-// valid until the next systemone_decide() on the same handle, from any thread: read it from the
+// The error JSON of the last systemone_decide() or systemone_chat() on this handle, "" if it succeeded.
+// The pointer is valid until the next request on the same handle, from any thread: read it from the
 // thread that got the error, before another request can run.
 const char * systemone_last_error(const systemone * so);
 

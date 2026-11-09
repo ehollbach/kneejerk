@@ -24,6 +24,7 @@ add_subdirectory(${SYSTEMONE_LLAMA_CPP_DIR} ${CMAKE_CURRENT_BINARY_DIR}/llama.cp
 
 add_library(systemone
     src/systemone.cpp
+    src/kneejerk.cpp
     src/upstream/server-decision.cpp
 )
 target_include_directories(systemone

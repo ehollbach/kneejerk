@@ -11,6 +11,8 @@
 #include "server-decision.h"
 #include "llama-ext.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +69,12 @@ struct systemone {
     std::string last_error;
     uint32_t n_ctx = 0;
     std::mutex mutex; // one request at a time: the context is shared
+
+    // chat mode
+    systemone_model mode = SYSTEMONE_MODEL_DECISION;
+    common_chat_templates_ptr chat_templates;
+    std::vector<std::string> control_texts; // texts of the control tokens, longest first
+    std::string control_first;              // the first byte of each
 
     ~systemone() {
         if (ctx)   llama_free(ctx);
@@ -215,13 +223,45 @@ struct systemone {
         return scores;
     }
 
-    // One request, start to end under the mutex, last_error included: two threads deciding on the same
-    // handle must not write last_error at the same time.
     std::string decide(const std::string & request) {
+        return locked([&] { return answer(request); });
+    }
+
+    std::string chat(const std::string & request) {
+        return locked([&] { return generate(request); });
+    }
+
+    // chat mode: the chat template of the model, and the control token texts to break in the messages
+    void init_chat() {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        chat_templates = common_chat_templates_init(model, "");
+        for (llama_token id = 0; id < llama_vocab_n_tokens(vocab); id++) {
+            if (llama_vocab_get_attr(vocab, id) & LLAMA_TOKEN_ATTR_CONTROL) {
+                const std::string text = llama_vocab_get_text(vocab, id);
+                if (text.size() >= 2) {
+                    control_texts.push_back(text);
+                }
+            }
+        }
+        std::stable_sort(control_texts.begin(), control_texts.end(), [](const std::string & a, const std::string & b) {
+            return a.size() > b.size();
+        });
+        for (const auto & text : control_texts) {
+            if (control_first.find(text[0]) == std::string::npos) {
+                control_first += text[0];
+            }
+        }
+    }
+
+private:
+    // One request, start to end under the mutex, last_error included: two threads on the same handle
+    // must not write last_error at the same time.
+    template <typename F>
+    std::string locked(F && fn) {
         std::lock_guard<std::mutex> lock(mutex);
         std::string out;
         try {
-            out = answer(request);
+            out = fn();
         } catch (...) {
             out = error_json("internal error", "server_error");
         }
@@ -233,9 +273,209 @@ struct systemone {
         return out;
     }
 
-private:
+    // a zero-width space after the first character of each control token text, so it stays text
+    // same as d1_break() of server-decision.cpp, with a cap on the passes for a hostile vocabulary
+    std::string break_control_tokens(const std::string & text) const {
+        static const std::string zwsp = "\xE2\x80\x8B";
+        std::string cur = text;
+        bool changed = true;
+        for (int pass = 0; changed && pass < 8; pass++) {
+            changed = false;
+            std::string out;
+            for (size_t i = 0; i < cur.size();) {
+                const std::string * hit = nullptr;
+                if (control_first.find(cur[i]) != std::string::npos) {
+                    for (const auto & ctrl : control_texts) {
+                        if (cur.compare(i, ctrl.size(), ctrl) == 0) {
+                            hit = &ctrl;
+                            break;
+                        }
+                    }
+                }
+                if (hit == nullptr) {
+                    out += cur[i++];
+                    continue;
+                }
+                const unsigned char c = (*hit)[0];
+                const size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+                out += hit->substr(0, n) + zwsp + hit->substr(n);
+                i += hit->size();
+                changed = true;
+            }
+            cur = std::move(out);
+        }
+        return cur;
+    }
+
+    // all the strings of a JSON value, keys too
+    json break_control_tokens(const json & val, int depth = 0) const {
+        if (depth >= 128) {
+            throw std::invalid_argument("JSON is nested more than 128 levels deep");
+        }
+        if (val.is_string()) {
+            return break_control_tokens(val.get<std::string>());
+        }
+        if (val.is_array()) {
+            json out = json::array();
+            for (const auto & item : val) {
+                out.push_back(break_control_tokens(item, depth + 1));
+            }
+            return out;
+        }
+        if (val.is_object()) {
+            json out = json::object();
+            for (const auto & [key, item] : val.items()) {
+                out[break_control_tokens(key)] = break_control_tokens(item, depth + 1);
+            }
+            return out;
+        }
+        return val;
+    }
+
+    // called with the mutex held
+    std::string generate(const std::string & request) {
+        if (mode != SYSTEMONE_MODEL_CHAT) {
+            return error_json("the model is loaded for decisions, load it with model = SYSTEMONE_MODEL_CHAT to chat", "invalid_request_error");
+        }
+        json body;
+        try {
+            body = json::parse(request);
+        } catch (const std::exception & e) {
+            return error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error");
+        }
+        try {
+            if (!body.is_object() || !body.contains("messages") || !body.at("messages").is_array() || body.at("messages").empty()) {
+                throw std::invalid_argument("\"messages\" must be a non-empty array");
+            }
+            common_chat_templates_inputs inputs;
+            try {
+                inputs.messages = common_chat_msgs_parse_oaicompat(break_control_tokens(body.at("messages")));
+            } catch (const std::exception & e) {
+                throw std::invalid_argument(std::string("messages: ") + e.what());
+            }
+            for (const auto & msg : inputs.messages) {
+                if (msg.contains_media()) {
+                    throw std::invalid_argument("images and audio are not supported by this library yet, use llama-server");
+                }
+            }
+
+            const int32_t  max_tokens  = json_value(body, "max_tokens", 256);
+            const float    temperature = json_value(body, "temperature", 0.8f);
+            const int32_t  top_k       = json_value(body, "top_k", 40);
+            const float    top_p       = json_value(body, "top_p", 0.95f);
+            const float    min_p       = json_value(body, "min_p", 0.05f);
+            const uint32_t seed        = json_value(body, "seed", (uint32_t) LLAMA_DEFAULT_SEED);
+            if (max_tokens < 1) {
+                throw std::invalid_argument("\"max_tokens\" must be at least 1");
+            }
+
+            const llama_vocab * vocab = llama_model_get_vocab(model);
+            inputs.add_generation_prompt = true;
+            inputs.add_bos = llama_vocab_get_add_bos(vocab); // the BOS text of the template is dropped, the token is added below
+            const std::string text = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
+            llama_tokens prompt = common_tokenize(vocab, text, false, true);
+            if (inputs.add_bos) {
+                prompt.insert(prompt.begin(), llama_vocab_bos(vocab));
+            }
+            if (prompt.size() >= n_ctx) {
+                throw std::invalid_argument(string_format(
+                    "the prompt (%zu tokens) leaves no room for a reply in the context (%u tokens), load with a larger n_ctx", prompt.size(), n_ctx));
+            }
+
+            llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            std::unique_ptr<llama_sampler, void (*)(llama_sampler *)> smpl_guard(smpl, llama_sampler_free);
+            if (temperature <= 0.0f) {
+                llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+            } else {
+                llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k));
+                llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p, 1));
+                llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p, 1));
+                llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature));
+                llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
+            }
+
+            llama_memory_t mem = llama_get_memory(ctx);
+            if (mem) {
+                llama_memory_clear(mem, true);
+            }
+            llama_set_embeddings(ctx, false);
+
+            llama_batch_ext * batch = llama_batch_ext_init(ctx);
+            std::unique_ptr<llama_batch_ext, void (*)(llama_batch_ext *)> batch_guard(batch, llama_batch_ext_free);
+            auto eval = [&](const llama_token * tokens, int32_t n_tokens, llama_pos pos_0) {
+                llama_batch_ext_clear(batch);
+                for (int32_t i = 0; i < n_tokens; i++) {
+                    const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens[i]);
+                    if (idx < 0) {
+                        throw std::runtime_error(string_format("the prompt (%d tokens) does not fit in one batch", n_tokens));
+                    }
+                    const llama_pos pos = pos_0 + i;
+                    llama_batch_ext_set_pos(batch, idx, &pos);
+                    if (i == n_tokens - 1) {
+                        llama_batch_ext_set_output_logits(batch, idx, true);
+                    }
+                }
+                const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+                if (rc != 0) {
+                    throw std::runtime_error(string_format("llama_process failed (%d)", rc));
+                }
+            };
+
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            eval(prompt.data(), (int32_t) prompt.size(), 0);
+            const auto t1 = clock::now();
+
+            std::string reply;
+            std::string finish_reason = "length";
+            int32_t   n_gen  = 0;
+            llama_pos n_past = (llama_pos) prompt.size();
+            while (n_gen < max_tokens) {
+                const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+                if (llama_vocab_is_eog(vocab, tok)) {
+                    finish_reason = "stop";
+                    break;
+                }
+                reply += common_token_to_piece(vocab, tok, false);
+                n_gen++;
+                if (n_gen == max_tokens || (uint32_t) n_past >= n_ctx) {
+                    break;
+                }
+                eval(&tok, 1, n_past++);
+            }
+            const auto t2 = clock::now();
+            const auto ms = [](clock::time_point a, clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+
+            json message = json::object();
+            message["role"]    = "assistant";
+            message["content"] = reply;
+            json usage = json::object();
+            usage["input_tokens"]  = (int32_t) prompt.size();
+            usage["output_tokens"] = n_gen;
+            json timings = json::object();
+            timings["prompt_ms"]     = ms(t0, t1);
+            timings["generation_ms"] = ms(t1, t2);
+            json out = json::object();
+            out["model"]         = model_name;
+            out["message"]       = message;
+            out["finish_reason"] = finish_reason;
+            out["usage"]         = usage;
+            out["timings"]       = timings;
+            return out.dump_safe(); // a reply cut by max_tokens can end inside a UTF-8 character
+        } catch (const std::invalid_argument & e) {
+            return error_json(e.what(), "invalid_request_error");
+        } catch (const std::exception & e) {
+            return error_json(e.what(), "server_error");
+        }
+    }
+
     // called with the mutex held
     std::string answer(const std::string & request) {
+        if (mode != SYSTEMONE_MODEL_DECISION) {
+            return error_json("the model is loaded for chat, use systemone_chat()", "invalid_request_error");
+        }
         if (decision.type == COMMON_DECISION_TYPE_NONE) {
             return error_json("This model is not a decision model", "not_supported_error");
         }
@@ -311,6 +551,28 @@ private:
     }
 };
 
+// nothing may cross the C ABI: an exception escaping here would abort the app
+static char * systemone_call(systemone * so, const char * request_json, std::string (systemone::*fn)(const std::string &)) {
+    static const char fallback[] = "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\"}}";
+    std::string out;
+    try {
+        if (!so || !request_json) {
+            out = error_json("no model or no request", "invalid_request_error");
+        } else {
+            out = (so->*fn)(request_json);
+        }
+    } catch (...) {
+        out.clear();
+    }
+    const char * src = out.empty() ? fallback : out.c_str();
+    const size_t n   = out.empty() ? sizeof(fallback) : out.size() + 1;
+    char * s = (char *) malloc(n);
+    if (s) {
+        memcpy(s, src, n);
+    }
+    return s;
+}
+
 extern "C" {
 
 systemone_params systemone_default_params(void) {
@@ -320,11 +582,17 @@ systemone_params systemone_default_params(void) {
     p.n_threads    = 0;
     p.verbose      = false;
     p.repack       = true;
+    p.model        = SYSTEMONE_MODEL_DECISION;
     return p;
 }
 
 systemone * systemone_load(const char * model_path, const systemone_params * params_in) {
     systemone_params params = params_in ? *params_in : systemone_default_params();
+    if (params.model != SYSTEMONE_MODEL_DECISION && params.model != SYSTEMONE_MODEL_CHAT) {
+        fprintf(stderr, "systemone: unknown model mode %d\n", (int) params.model);
+        return nullptr;
+    }
+    const bool is_chat = params.model == SYSTEMONE_MODEL_CHAT;
     if (!params.verbose) {
         llama_log_set(quiet_log, nullptr);
     }
@@ -333,6 +601,7 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
 
     auto so = std::make_unique<systemone>();
     so->n_ctx = params.n_ctx ? params.n_ctx : 4096;
+    so->mode  = params.model;
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = params.n_gpu_layers < 0 ? 999 : params.n_gpu_layers;
@@ -346,7 +615,7 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = so->n_ctx;
     cparams.n_batch   = so->n_ctx; // the whole prompt goes through in one batch
-    cparams.n_ubatch  = so->n_ctx;
+    cparams.n_ubatch  = is_chat ? std::min<uint32_t>(so->n_ctx, 512) : so->n_ctx; // chat: smaller compute buffers, less RAM
     cparams.n_seq_max = 1;
     cparams.no_perf   = true;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
@@ -361,12 +630,17 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     }
 
     try {
-        so->decision.init(so->model);
+        if (is_chat) {
+            so->init_chat();
+            so->type_name = "chat";
+        } else {
+            so->decision.init(so->model);
+            so->type_name = decision_type_name(so->decision.type);
+        }
     } catch (const std::exception & e) {
-        fprintf(stderr, "systemone: failed to init the decision model: %s\n", e.what());
+        fprintf(stderr, "systemone: failed to init the %s model: %s\n", is_chat ? "chat" : "decision", e.what());
         return nullptr;
     }
-    so->type_name = decision_type_name(so->decision.type);
 
     const char * slash = strrchr(model_path, '/');
     so->model_name = slash ? slash + 1 : model_path;
@@ -382,25 +656,11 @@ const char * systemone_model_type(const systemone * so) {
 }
 
 char * systemone_decide(systemone * so, const char * request_json) {
-    // nothing may cross the C ABI: an exception escaping here would abort the app
-    static const char fallback[] = "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\"}}";
-    std::string out;
-    try {
-        if (!so || !request_json) {
-            out = error_json("no model or no request", "invalid_request_error");
-        } else {
-            out = so->decide(request_json);
-        }
-    } catch (...) {
-        out.clear();
-    }
-    const char * src = out.empty() ? fallback : out.c_str();
-    const size_t n   = out.empty() ? sizeof(fallback) : out.size() + 1;
-    char * s = (char *) malloc(n);
-    if (s) {
-        memcpy(s, src, n);
-    }
-    return s;
+    return systemone_call(so, request_json, &systemone::decide);
+}
+
+char * systemone_chat(systemone * so, const char * request_json) {
+    return systemone_call(so, request_json, &systemone::chat);
 }
 
 void systemone_free_string(char * s) {

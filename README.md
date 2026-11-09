@@ -67,8 +67,28 @@ systemone_free_string(answer);
 systemone_free(so);
 ```
 
-Link `libsystemone` (it brings `llama` with it). Six functions, C ABI, so Swift, Kotlin/JNI,
+Link `libsystemone` (it brings `llama` with it). A handful of functions, C ABI, so Swift, Kotlin/JNI,
 Dart and Rust bindings are thin. The Capacitor plugin that started this comes next.
+
+## Chat models too
+
+A model is loaded for decisions by default. Any GGUF with a chat template can be loaded for text
+generation instead: `params.model = SYSTEMONE_MODEL_CHAT`, then `systemone_chat()` with an
+OpenAI-style `{"messages": [...]}` body. From C++ (`kneejerk.hpp`) it is one argument:
+
+```cpp
+#include "kneejerk.hpp"
+
+kneejerk::Assistant judge("d1-2B-Q4_K_M.gguf");                               // Model::Decision
+kneejerk::Assistant talker("qwen1_5-0_5b-chat-q2_k.gguf", kneejerk::Model::Chat);
+
+std::string answer = judge.decide(request_json);
+std::string reply  = talker.chat("Summarise my last message");
+```
+
+On the command line: `echo 'Hello, who are you?' | ./build/systemone-cli -m MODEL.gguf --chat --time`.
+The answer carries `usage` and `timings` (`prompt_ms`, `generation_ms`). Control-token texts in the
+messages are broken with a zero-width space, so a message cannot open a turn of its own.
 
 ## Which models
 

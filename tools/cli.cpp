@@ -3,6 +3,10 @@
 //   echo '{"state": "...", "questions": {...}}' | systemone-cli -m d1-2B-Q4_K_M.gguf
 //
 // The same body llama-server's /v1/systemone takes, so the two can be compared (tests/parity.py).
+//
+//   echo 'Hello, who are you?' | systemone-cli -m qwen1_5-0_5b-chat-q2_k.gguf --chat
+//
+// With --chat a line is a chat request ({"messages": [...]}), or plain text: one user message.
 
 #include "systemone.h"
 
@@ -15,11 +19,30 @@
 
 static void usage(const char * argv0) {
     fprintf(stderr,
-            "usage: %s -m MODEL.gguf [-ngl N] [-c N_CTX] [-t THREADS] [--no-repack] [--time] [-v]\n"
+            "usage: %s -m MODEL.gguf [-ngl N] [-c N_CTX] [-t THREADS] [--chat] [--no-repack] [--time] [-v]\n"
             "  reads one JSON request per line from stdin, writes one JSON answer per line\n"
+            "  --chat       load the model for chat, not for decisions: a line is {\"messages\": [...]} or plain text\n"
             "  --time       adds \"_wall_ms\" to every answer\n"
             "  --no-repack  no repacked copy of the weights: about half the RAM, slower on ARM\n",
             argv0);
+}
+
+// a plain text line as a chat request with one user message
+static std::string user_message_request(const std::string & text) {
+    std::string out = "{\"messages\":[{\"role\":\"user\",\"content\":\"";
+    for (const unsigned char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += (char) c;
+        } else if (c < 0x20) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+        } else {
+            out += (char) c;
+        }
+    }
+    return out + "\"}]}";
 }
 
 int main(int argc, char ** argv) {
@@ -43,6 +66,8 @@ int main(int argc, char ** argv) {
             params.n_ctx = (uint32_t) atoi(next("-c"));
         } else if (a == "-t" || a == "--threads") {
             params.n_threads = atoi(next("-t"));
+        } else if (a == "--chat") {
+            params.model = SYSTEMONE_MODEL_CHAT;
         } else if (a == "--no-repack") {
             params.repack = false;
         } else if (a == "--time") {
@@ -67,7 +92,12 @@ int main(int argc, char ** argv) {
     if (!so) {
         return 1;
     }
-    fprintf(stderr, "systemone-cli: %s loaded, decision model type %s\n", model, systemone_model_type(so));
+    const bool is_chat = params.model == SYSTEMONE_MODEL_CHAT;
+    if (is_chat) {
+        fprintf(stderr, "systemone-cli: %s loaded for chat\n", model);
+    } else {
+        fprintf(stderr, "systemone-cli: %s loaded, decision model type %s\n", model, systemone_model_type(so));
+    }
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -75,7 +105,8 @@ int main(int argc, char ** argv) {
             continue;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        char * answer = systemone_decide(so, line.c_str());
+        char * answer = is_chat ? systemone_chat(so, (line[0] == '{' ? line : user_message_request(line)).c_str())
+                                : systemone_decide(so, line.c_str());
         if (!answer) {
             fprintf(stderr, "systemone-cli: out of memory\n");
             systemone_free(so);
