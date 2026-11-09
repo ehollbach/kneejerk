@@ -32,6 +32,8 @@ the model load), RES in MB, and whether Android killed the process. Open an issu
 of most phones; more threads are often slower.
 
 iOS 12: circumvention used to install OpenSSH via "Chimera (patched)" and "Sileo" OSS App Store.
+
+
 iOS 18: simply build a self signed .ipa without Chimera. Must turn developer mode on first.
 
 ## Measured so far
