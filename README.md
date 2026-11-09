@@ -105,10 +105,12 @@ Yes. First measurement, 9 November 2026, the binary built in Termux, d1-2B Q4_K_
 
 | phone | RAM | yes/no, 44 tokens | choice of four, 87 tokens | process RSS |
 |---|---|---|---|---|
-| Google Pixel 8a (Tensor G3) | 8 GB | 464 ms | 1 100 ms | 2.1 GB (1.1 GB model mapped + repacked copy); `--no-repack` halves it, timing pending |
+| Google Pixel 8a (Tensor G3) | 8 GB | 464 ms | 1 100 ms | 2.1 GB (1.1 GB model mapped + a repacked copy) |
+| the same with `--no-repack` | | 1 210 ms | | 1.1 GB |
 
 Same probabilities as on the desktop to three decimals. Half a second per decision is five times a
-desktop CPU, and still before a message would reach a server. [docs/phone.md](docs/phone.md) has the
+desktop CPU, and still before a message would reach a server. Repacking the weights for the ARM
+kernels costs a second copy of the model in RAM and buys 2.6× speed; pick per device. [docs/phone.md](docs/phone.md) has the
 recipe; numbers from other phones are what this repo needs most, open an issue with yours.
 
 ## Parity

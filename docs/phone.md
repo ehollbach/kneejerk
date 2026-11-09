@@ -39,6 +39,7 @@ Metal with `-DGGML_METAL=ON`; the plumbing into an app is the next step, see the
 | phone | RAM | yes/no, 44 tokens | choice of four, 87 tokens | RSS | threads | date |
 |---|---|---|---|---|---|---|
 | Google Pixel 8a (Tensor G3) | 8 GB | 464 ms | 1 100 ms | 2.1 GB with repack | 4 | 2026-11-09 |
+| Google Pixel 8a, `--no-repack` | 8 GB | 1 210 ms | | 1.1 GB | 4 | 2026-11-09 |
 
 Notes from that run: Termux needs `pkg upgrade` first (its cmake was newer than its libc++);
 build with `-j2` and `termux-wake-lock`, a full `-j` build got killed; the Hugging Face download
