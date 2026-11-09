@@ -46,11 +46,16 @@ const char * systemone_model_type(const systemone * so);
 char * systemone_decide(systemone * so, const char * request_json);
 
 // Chat mode: the reply to a conversation. The request is {"messages": [{"role", "content"}, ...]} in the OpenAI
-// format, with optional "max_tokens" (256), "temperature" (0.8, 0 = greedy), "top_k" (40), "top_p" (0.95),
-// "min_p" (0.05) and "seed". Returns a malloc'd JSON string: {"model", "message": {"role", "content"},
-// "finish_reason": "stop" or "length", "usage", "timings"}, or {"error": ...}. Free it with systemone_free_string().
+// format, or {"prompt": "raw text"} to continue text without the chat template (for base models), with optional
+// "max_tokens" (256), "temperature" (0.8, 0 = greedy), "top_k" (40), "top_p" (0.95), "min_p" (0.05), "seed" and
+// "stop" (a string or an array of strings that end the reply; the matched string is cut from it). Returns a
+// malloc'd JSON string: {"model", "message": {"role", "content"} or "text" for a prompt, "finish_reason": "stop"
+// or "length", "stop_sequence" if a stop string ended it, "usage", "timings"}, or {"error": ...}. Free it with
+// systemone_free_string().
 // Control-token texts in the messages (e.g. "<|im_start|>") are broken with a zero-width space, so a message
-// cannot open a turn of its own. Same threading and NULL rules as systemone_decide().
+// cannot open a turn of its own at the token level. The model can still follow instructions written in a
+// message (prompt injection): treat a reply to untrusted text as untrusted. Same threading and NULL rules as
+// systemone_decide(). SYSTEMONE_DUMP=1 prints the rendered prompt to stderr.
 char * systemone_chat(systemone * so, const char * request_json);
 
 void systemone_free_string(char * s);

@@ -6,7 +6,8 @@
 //
 //   echo 'Hello, who are you?' | systemone-cli -m qwen1_5-0_5b-chat-q2_k.gguf --chat
 //
-// With --chat a line is a chat request ({"messages": [...]}), or plain text: one user message.
+// With --chat a line is a chat request ({"messages": [...]}), raw text to continue ({"prompt": "...", "stop": "."}),
+// or plain text: one user message.
 
 #include "systemone.h"
 
@@ -21,7 +22,8 @@ static void usage(const char * argv0) {
     fprintf(stderr,
             "usage: %s -m MODEL.gguf [-ngl N] [-c N_CTX] [-t THREADS] [--chat] [--no-repack] [--time] [-v]\n"
             "  reads one JSON request per line from stdin, writes one JSON answer per line\n"
-            "  --chat       load the model for chat, not for decisions: a line is {\"messages\": [...]} or plain text\n"
+            "  --chat       load the model for chat, not for decisions: a line is {\"messages\": [...]},\n"
+            "               {\"prompt\": \"raw text\", \"stop\": [\".\"]} (no chat template) or plain text\n"
             "  --time       adds \"_wall_ms\" to every answer\n"
             "  --no-repack  no repacked copy of the weights: about half the RAM, slower on ARM\n",
             argv0);

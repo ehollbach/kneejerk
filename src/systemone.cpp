@@ -344,18 +344,50 @@ private:
             return error_json(std::string("invalid JSON: ") + e.what(), "invalid_request_error");
         }
         try {
-            if (!body.is_object() || !body.contains("messages") || !body.at("messages").is_array() || body.at("messages").empty()) {
+            const bool has_messages = body.is_object() && body.contains("messages");
+            const bool has_prompt   = body.is_object() && body.contains("prompt");
+            if (has_messages == has_prompt) {
+                throw std::invalid_argument("give either \"messages\" (a conversation) or \"prompt\" (raw text to continue)");
+            }
+            if (has_messages && (!body.at("messages").is_array() || body.at("messages").empty())) {
                 throw std::invalid_argument("\"messages\" must be a non-empty array");
             }
-            common_chat_templates_inputs inputs;
-            try {
-                inputs.messages = common_chat_msgs_parse_oaicompat(break_control_tokens(body.at("messages")));
-            } catch (const std::exception & e) {
-                throw std::invalid_argument(std::string("messages: ") + e.what());
+            if (has_prompt && (!body.at("prompt").is_string() || body.at("prompt").get<std::string>().empty())) {
+                throw std::invalid_argument("\"prompt\" must be a non-empty string");
             }
-            for (const auto & msg : inputs.messages) {
-                if (msg.contains_media()) {
-                    throw std::invalid_argument("images and audio are not supported by this library yet, use llama-server");
+            common_chat_templates_inputs inputs;
+            if (has_messages) {
+                try {
+                    inputs.messages = common_chat_msgs_parse_oaicompat(break_control_tokens(body.at("messages")));
+                } catch (const std::exception & e) {
+                    throw std::invalid_argument(std::string("messages: ") + e.what());
+                }
+                for (const auto & msg : inputs.messages) {
+                    if (msg.contains_media()) {
+                        throw std::invalid_argument("images and audio are not supported by this library yet, use llama-server");
+                    }
+                }
+            }
+
+            std::vector<std::string> stops;
+            if (body.contains("stop") && !body.at("stop").is_null()) {
+                const json & stop = body.at("stop");
+                if (stop.is_string()) {
+                    stops.push_back(stop.get<std::string>());
+                } else if (stop.is_array()) {
+                    for (const auto & item : stop) {
+                        if (!item.is_string()) {
+                            throw std::invalid_argument("\"stop\" must be a string or an array of strings");
+                        }
+                        stops.push_back(item.get<std::string>());
+                    }
+                } else {
+                    throw std::invalid_argument("\"stop\" must be a string or an array of strings");
+                }
+                for (const auto & s : stops) {
+                    if (s.empty()) {
+                        throw std::invalid_argument("\"stop\" strings must not be empty");
+                    }
                 }
             }
 
@@ -370,12 +402,23 @@ private:
             }
 
             const llama_vocab * vocab = llama_model_get_vocab(model);
-            inputs.add_generation_prompt = true;
-            inputs.add_bos = llama_vocab_get_add_bos(vocab); // the BOS text of the template is dropped, the token is added below
-            const std::string text = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
-            llama_tokens prompt = common_tokenize(vocab, text, false, true);
-            if (inputs.add_bos) {
-                prompt.insert(prompt.begin(), llama_vocab_bos(vocab));
+            std::string  text;
+            llama_tokens prompt;
+            if (has_messages) {
+                inputs.add_generation_prompt = true;
+                inputs.add_bos = llama_vocab_get_add_bos(vocab); // the BOS text of the template is dropped, the token is added below
+                text   = common_chat_templates_apply(chat_templates.get(), inputs).prompt.str();
+                prompt = common_tokenize(vocab, text, false, true);
+                if (inputs.add_bos) {
+                    prompt.insert(prompt.begin(), llama_vocab_bos(vocab));
+                }
+            } else {
+                // raw text, no chat template; control-token texts stay plain text (parse_special = false)
+                text   = body.at("prompt").get<std::string>();
+                prompt = common_tokenize(vocab, text, llama_vocab_get_add_bos(vocab), false);
+            }
+            if (getenv("SYSTEMONE_DUMP") != nullptr) {
+                fprintf(stderr, "--- chat prompt (%zu tokens) ---\n%s\n---\n", prompt.size(), text.c_str());
             }
             if (prompt.size() >= n_ctx) {
                 throw std::invalid_argument(string_format(
@@ -428,6 +471,11 @@ private:
 
             std::string reply;
             std::string finish_reason = "length";
+            std::string stop_sequence;
+            size_t      max_stop = 0;
+            for (const auto & s : stops) {
+                max_stop = std::max(max_stop, s.size());
+            }
             int32_t   n_gen  = 0;
             llama_pos n_past = (llama_pos) prompt.size();
             while (n_gen < max_tokens) {
@@ -436,8 +484,26 @@ private:
                     finish_reason = "stop";
                     break;
                 }
+                const size_t prev = reply.size();
                 reply += common_token_to_piece(vocab, tok, false);
                 n_gen++;
+                if (!stops.empty()) {
+                    // a stop string can straddle tokens: search from the first place a match ending in the new piece can start
+                    const size_t from = prev + 1 >= max_stop ? prev + 1 - max_stop : 0;
+                    size_t at = std::string::npos;
+                    for (const auto & s : stops) {
+                        const size_t pos = reply.find(s, from);
+                        if (pos < at) {
+                            at            = pos;
+                            stop_sequence = s;
+                        }
+                    }
+                    if (at != std::string::npos) {
+                        reply.resize(at); // the stop string is not part of the reply, as in the OpenAI API
+                        finish_reason = "stop";
+                        break;
+                    }
+                }
                 if (n_gen == max_tokens || (uint32_t) n_past >= n_ctx) {
                     break;
                 }
@@ -448,9 +514,6 @@ private:
                 return std::chrono::duration<double, std::milli>(b - a).count();
             };
 
-            json message = json::object();
-            message["role"]    = "assistant";
-            message["content"] = reply;
             json usage = json::object();
             usage["input_tokens"]  = (int32_t) prompt.size();
             usage["output_tokens"] = n_gen;
@@ -458,9 +521,19 @@ private:
             timings["prompt_ms"]     = ms(t0, t1);
             timings["generation_ms"] = ms(t1, t2);
             json out = json::object();
-            out["model"]         = model_name;
-            out["message"]       = message;
+            out["model"] = model_name;
+            if (has_messages) {
+                json message = json::object();
+                message["role"]    = "assistant";
+                message["content"] = reply;
+                out["message"]     = message;
+            } else {
+                out["text"] = reply;
+            }
             out["finish_reason"] = finish_reason;
+            if (!stop_sequence.empty()) {
+                out["stop_sequence"] = stop_sequence;
+            }
             out["usage"]         = usage;
             out["timings"]       = timings;
             return out.dump_safe(); // a reply cut by max_tokens can end inside a UTF-8 character

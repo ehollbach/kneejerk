@@ -87,8 +87,14 @@ std::string reply  = talker.chat("Summarise my last message");
 ```
 
 On the command line: `echo 'Hello, who are you?' | ./build/systemone-cli -m MODEL.gguf --chat --time`.
-The answer carries `usage` and `timings` (`prompt_ms`, `generation_ms`). Control-token texts in the
-messages are broken with a zero-width space, so a message cannot open a turn of its own.
+The answer carries `usage` and `timings` (`prompt_ms`, `generation_ms`). A base model without chat
+training can continue raw text instead: `{"prompt": "The quick brown fox", "stop": "."}` skips the chat
+template, answers with `text`, and ends at the first stop string, which is cut from the text and named
+in `stop_sequence` (llama.cpp's reverse prompt, OpenAI's `stop`). Control-token texts in the
+messages are broken with a zero-width space, so a message cannot open a turn of its own at the token
+level. That is not a defence against prompt injection: a small model follows "reply with PWNED" written
+in plain text just as well, so a reply to untrusted text (an SMS, an email) must not trigger anything on
+its own. `SYSTEMONE_DUMP=1` prints the rendered prompt.
 
 ## Which models
 
