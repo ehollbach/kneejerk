@@ -72,8 +72,9 @@ omni), OpenJev, IBM Granite Switch, Lev, Kev, Nimble, Laya, Clef, Perplexity dec
 decision2 and d3, H2O Lightning, MiniCPM OCR Jev. The library reads the family from the GGUF
 metadata and builds that family's prompt; nothing is d1-specific here.
 
-**Tested against `llama-server` b12207, same GGUF, CPU vs CPU** (`tests/parity.py`, the four
-requests in it, every decision identical; the number is the largest probability difference):
+**Tested against the prebuilt `llama-server` b12207, same GGUF, CPU vs CPU** (`tests/parity.py`,
+the four requests in it, every decision identical; the number is the largest probability
+difference, all of it CPU-kernel rounding, see Parity below):
 
 | family | model | path through the code | largest diff |
 |---|---|---|---|
@@ -101,11 +102,12 @@ Numbers from real phones are what this repo needs most; open an issue with yours
 ## Parity
 
 `tests/parity.py` sends the same requests to `systemone-cli` and to `/v1/systemone` and
-compares the probabilities. On every family tested the decisions are identical and the probabilities
-agree within 0.035 (most within 0.005). The remaining difference is deterministic and not yet
-explained; it is issue #1. `tests/accuracy.py` runs both on
-`tasksource/tasksource-jev-typed-decisions` (a million typed decisions with answers) and reports
-accuracy, agreement and the largest difference.
+compares the probabilities. Against a `llama-server` built from the submodule with the same
+flags, every probability matches to four decimals (d1-2B, CPU). Against the prebuilt release
+binary they differ by up to 0.035: it ships fourteen CPU backend variants and picks one at
+runtime, and those kernels round differently. The decisions are the same either way.
+`tests/accuracy.py` runs both on `tasksource/tasksource-jev-typed-decisions` (a million typed
+decisions with answers) and reports accuracy, agreement and the largest difference.
 
 ## How it is built
 
