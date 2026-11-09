@@ -72,10 +72,23 @@ omni), OpenJev, IBM Granite Switch, Lev, Kev, Nimble, Laya, Clef, Perplexity dec
 decision2 and d3, H2O Lightning, MiniCPM OCR Jev. The library reads the family from the GGUF
 metadata and builds that family's prompt; nothing is d1-specific here.
 
-**Tested so far: `LiquidAI/d1-2B-GGUF` (Q4_K_M), text only.** Every other family compiles and
-should work, and I have not run it. If you have one of those models, please run
-`tests/parity.py` against a `llama-server` with the same file and open an issue with the
-output, pass or fail. That is the most useful thing you can do for this repo right now.
+**Tested against `llama-server` b12207, same GGUF, CPU vs CPU** (`tests/parity.py`, the four
+requests in it, every decision identical; the number is the largest probability difference):
+
+| family | model | path through the code | largest diff |
+|---|---|---|---|
+| lfm3-d1 | LiquidAI/d1-2B-GGUF Q4_K_M | logits of option tokens | 0.018 |
+| laya | ggml-org/Laya-GGUF Q8_0 | embeddings at option markers | 0.0095 |
+| h2o-lightning | h2oai/h2o-lightning-4b-gguf IQ3_XXS | logits, H2O's own rendering | 0.0115 |
+| clef | bartowski/Cloudflare_clef-flash-GGUF Q2_K | joint head, all questions in one prompt | 0.035 |
+
+Perplexity's own `pplx-decider-flash-gguf-v1.2` carries no decision metadata
+(`<arch>.decision.type`, `tokenizer.chat_template.systemone`), so neither llama-server nor this
+library treats it as a decision model; a re-export with the metadata would run. OpenJev, Granite
+Switch, Lev, Kev, Nimble, vLLM decision2/d3 and MiniCPM OCR Jev compile and are untested here: I
+found no GGUF, or none small enough to run on a CPU box tonight. If you have one, run
+`tests/parity.py` against a `llama-server` with the same file and open an issue with the output,
+pass or fail. That is the most useful thing you can do for this repo right now.
 
 Images, audio and video are not in yet: a request with files gets an error and a pointer to
 `llama-server`.
@@ -88,9 +101,9 @@ Numbers from real phones are what this repo needs most; open an issue with yours
 ## Parity
 
 `tests/parity.py` sends the same requests to `systemone-cli` and to `/v1/systemone` and
-compares the probabilities. On d1-2B, CPU against CPU, the decisions are identical and the
-probabilities agree within 0.02 (most within 0.005). The remaining difference is deterministic
-and not yet explained; it is issue #1. `tests/accuracy.py` runs both on
+compares the probabilities. On every family tested the decisions are identical and the probabilities
+agree within 0.035 (most within 0.005). The remaining difference is deterministic and not yet
+explained; it is issue #1. `tests/accuracy.py` runs both on
 `tasksource/tasksource-jev-typed-decisions` (a million typed decisions with answers) and reports
 accuracy, agreement and the largest difference.
 

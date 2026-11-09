@@ -1,0 +1,60 @@
+=================== ggml-org/Laya-GGUF:Q8_0 ===================
+decision model type: laya
+file: /home/kachna/.cache/huggingface/hub/models--ggml-org--Laya-GGUF/snapshots/845f314dd047fc2444a5289a4d50c1e1d59e27e1/Laya-Q8_0.gguf
+== case 0 · cli 158 ms · 145 tokens
+  refund     cli ['0.7894']  server ['0.7861']  diff 0.0033
+  team       cli ['0.9595', '0.0197', '0.0208']  server ['0.9616', '0.0189', '0.0195']  diff 0.0021
+  urgency    cli ['0.0225', '0.2394', '0.7380']  server ['0.0253', '0.2462', '0.7285']  diff 0.0095
+== case 1 · cli 170 ms · 165 tokens
+  kind       cli ['0.2222', '0.0355', '0.5048', '0.1258', '0.1117']  server ['0.2146', '0.0351', '0.5139', '0.1282', '0.1082']  diff 0.0092
+  named      cli ['0.0056']  server ['0.0066']  diff 0.0010
+== case 2 · cli 125 ms · 118 tokens
+  team       cli ['0.0269', '0.9731']  server ['0.0268', '0.9732']  diff 0.0001
+  severity   cli ['0.0171', '0.2890', '0.1291', '0.5648']  server ['0.0169', '0.2912', '0.1255', '0.5664']  diff 0.0036
+== case 3 · cli 53 ms · 50 tokens
+  asks       cli ['0.0299']  server ['0.0314']  diff 0.0014
+
+largest difference: 0.0095 (OK 0.01)
+=================== h2oai/h2o-lightning-4b-gguf:IQ3_XXS ===================
+decision model type: h2o-lightning
+file: /home/kachna/.cache/huggingface/hub/models--h2oai--h2o-lightning-4b-gguf/snapshots/61f8d8b7a8c2d84426d0d143ca187f65d235934b/h2o-lightning-4b-IQ3_XXS.gguf
+== case 0 · cli 1502 ms · 294 tokens
+  refund     cli ['0.9309']  server ['0.9286']  diff 0.0023
+  team       cli ['0.9480', '0.0252', '0.0269']  server ['0.9476', '0.0255', '0.0269']  diff 0.0003
+  urgency    cli ['0.0932', '0.7288', '0.1779']  server ['0.0872', '0.7335', '0.1793']  diff 0.0060
+== case 1 · cli 1243 ms · 267 tokens
+  kind       cli ['0.0202', '0.0075', '0.9572', '0.0074', '0.0077']  server ['0.0203', '0.0075', '0.9567', '0.0074', '0.0081']  diff 0.0005
+  named      cli ['0.0781']  server ['0.0777']  diff 0.0004
+== case 2 · cli 1072 ms · 217 tokens
+  team       cli ['0.0641', '0.9359']  server ['0.0545', '0.9455']  diff 0.0095
+  severity   cli ['0.0100', '0.0440', '0.6656', '0.2803']  server ['0.0096', '0.0423', '0.6771', '0.2709']  diff 0.0115
+== case 3 · cli 469 ms · 94 tokens
+  asks       cli ['0.0810']  server ['0.0815']  diff 0.0005
+
+largest difference: 0.0115 (ABOVE TOLERANCE 0.01)
+=================== perplexity-ai/pplx-decider-flash-gguf-v1.2:q8_0 ===================
+file: /home/kachna/.cache/huggingface/hub/models--perplexity-ai--pplx-decider-flash-gguf-v1.2/snapshots/2514d5f0b7fbbe1ee1bfec9ffb5801a60289b4cc/decider-flash-v1.2-q8_0.gguf
+case 0: cli error {'message': 'This model is not a decision model', 'type': 'not_supported_error'}
+case 1: cli error {'message': 'This model is not a decision model', 'type': 'not_supported_error'}
+case 2: cli error {'message': 'This model is not a decision model', 'type': 'not_supported_error'}
+case 3: cli error {'message': 'This model is not a decision model', 'type': 'not_supported_error'}
+
+largest difference: 1.0000 (ABOVE TOLERANCE 0.01)
+=================== bartowski/Cloudflare_clef-flash-GGUF:Q2_K ===================
+decision model type: clef
+file: /home/kachna/.cache/huggingface/hub/models--bartowski--Cloudflare_clef-flash-GGUF/snapshots/5fcdd9ba6d3d5b962ad149e31457de5783e49de5/Cloudflare_clef-flash-Q2_K.gguf
+== case 0 · cli 5212 ms · 334 tokens
+  refund     cli ['0.8501']  server ['0.8546']  diff 0.0045
+  team       cli ['0.9883', '0.0082', '0.0034']  server ['0.9882', '0.0083', '0.0035']  diff 0.0001
+  urgency    cli ['0.3120', '0.4252', '0.2628']  server ['0.3109', '0.4198', '0.2693']  diff 0.0065
+== case 1 · cli 5229 ms · 327 tokens
+  kind       cli ['0.0204', '0.9296', '0.0374', '0.0089', '0.0036']  server ['0.0203', '0.9296', '0.0378', '0.0089', '0.0034']  diff 0.0004
+  named      cli ['0.1568']  server ['0.1915']  diff 0.0347
+== case 2 · cli 4145 ms · 257 tokens
+  team       cli ['0.0333', '0.9667']  server ['0.0361', '0.9639']  diff 0.0028
+  severity   cli ['0.0256', '0.0613', '0.7157', '0.1974']  server ['0.0260', '0.0599', '0.7321', '0.1820']  diff 0.0164
+== case 3 · cli 2589 ms · 159 tokens
+  asks       cli ['0.0703']  server ['0.0696']  diff 0.0007
+
+largest difference: 0.0347 (ABOVE TOLERANCE 0.01)
+MATRIX_DONE
