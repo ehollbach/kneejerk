@@ -5,9 +5,9 @@ Not behind a server, not through an HTTP port on localhost: inside the app, on t
 Capacitor plugin. Decisions on a device exist in other shapes: in the browser with Transformers.js
 ([open-jev](https://github.com/nico-martin/open-jev)), on a Mac through Core ML with one model
 converted by hand ([FluidUse](https://github.com/FluidInference/FluidUse)), offline ONNX runtimes
-([edgejev](https://github.com/yzfly/edgejev)). What nobody had is the GGUF route: every decision
-model llama.cpp already speaks, one C API, native, no conversion. So there is nothing left for me
-but to do it.
+([edgejev](https://github.com/yzfly/edgejev)). What nobody had is the route that is both native and general: a C
+library linked into the app itself, taking every decision model llama.cpp already speaks straight
+from its GGUF, no conversion, one model or the next. So there is nothing left for me but to do it.
 
 A decision model doesn't write. It takes a *state* (text) and typed *questions* (yes/no, a
 choice, a score) and returns calibrated probabilities in one forward pass. No tokens generated,
