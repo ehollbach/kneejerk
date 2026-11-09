@@ -1,8 +1,8 @@
 # kneejerk
 
-I want Jev-like decision models in the device, natively. Not behind a server, not through an
-HTTP port on localhost: inside the app, on the phone, in a Capacitor plugin. Nobody has done
-that yet, so there is nothing left for me but to do it.
+I want Jev-like decision models in the device, natively, and I want it fast, because it is cool.
+Not behind a server, not through an HTTP port on localhost: inside the app, on the phone, in a
+Capacitor plugin. Nobody has done that yet, so there is nothing left for me but to do it.
 
 A decision model doesn't write. It takes a *state* (text) and typed *questions* (yes/no, a
 choice, a score) and returns calibrated probabilities in one forward pass. No tokens generated,
@@ -80,12 +80,19 @@ output, pass or fail. That is the most useful thing you can do for this repo rig
 Images, audio and video are not in yet: a request with files gets an error and a pointer to
 `llama-server`.
 
+## Does it run on a phone?
+
+[docs/phone.md](docs/phone.md): the same binary in Termux, timed, before any app is touched.
+Numbers from real phones are what this repo needs most; open an issue with yours.
+
 ## Parity
 
 `tests/parity.py` sends the same requests to `systemone-cli` and to `/v1/systemone` and
 compares the probabilities. On d1-2B, CPU against CPU, the decisions are identical and the
 probabilities agree within 0.02 (most within 0.005). The remaining difference is deterministic
-and not yet explained; it is issue #1.
+and not yet explained; it is issue #1. `tests/accuracy.py` runs both on
+`tasksource/tasksource-jev-typed-decisions` (a million typed decisions with answers) and reports
+accuracy, agreement and the largest difference.
 
 ## How it is built
 

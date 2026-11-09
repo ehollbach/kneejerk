@@ -12,6 +12,7 @@
 #include "llama-ext.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -126,6 +127,15 @@ struct systemone {
 
         std::vector<float> scores;
         const llama_vocab * vocab = llama_model_get_vocab(model);
+        const bool dump = getenv("SYSTEMONE_DUMP") != nullptr; // the prompt and the raw scores, to compare with llama-server
+        if (dump) {
+            std::string text;
+            for (const llama_token t : tokens) {
+                text += common_token_to_piece(vocab, t, true);
+            }
+            fprintf(stderr, "--- prompt (%d tokens) ---\n%s\n--- labels %zu groups %zu markers %zu pointer %d order %zu pooled %d ---\n",
+                    n_tokens, text.c_str(), d.labels.size(), d.label_groups.size(), d.markers.size(), d.pointer, d.order.size(), (int) d.pooled);
+        }
 
         if (d.pooled) {
             const float * embd = llama_get_embeddings_seq(ctx, 0);
@@ -159,6 +169,11 @@ struct systemone {
                     i += n;
                 }
                 scores = std::move(pooled);
+            }
+            if (dump) {
+                fprintf(stderr, "--- raw scores:");
+                for (const float v : scores) fprintf(stderr, " %.5f", v);
+                fprintf(stderr, "\n");
             }
             return scores;
         }
