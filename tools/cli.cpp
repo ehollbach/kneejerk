@@ -76,6 +76,11 @@ int main(int argc, char ** argv) {
         }
         const auto t0 = std::chrono::steady_clock::now();
         char * answer = systemone_decide(so, line.c_str());
+        if (!answer) {
+            fprintf(stderr, "systemone-cli: out of memory\n");
+            systemone_free(so);
+            return 1;
+        }
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::string out = answer;
         systemone_free_string(answer);
