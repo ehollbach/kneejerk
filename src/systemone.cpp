@@ -300,6 +300,7 @@ systemone_params systemone_default_params(void) {
     p.n_ctx        = 4096;
     p.n_threads    = 0;
     p.verbose      = false;
+    p.repack       = true;
     return p;
 }
 
@@ -316,6 +317,7 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = params.n_gpu_layers < 0 ? 999 : params.n_gpu_layers;
+    mparams.use_extra_bufts = params.repack; // repacked copies of the weights: ~1 GB more RAM for d1-2B, faster on ARM
     so->model = llama_model_load_from_file(model_path, mparams);
     if (!so->model) {
         fprintf(stderr, "systemone: failed to load %s\n", model_path);

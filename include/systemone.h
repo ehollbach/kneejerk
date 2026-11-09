@@ -19,6 +19,7 @@ typedef struct systemone_params {
     uint32_t n_ctx;         // longest prompt in tokens (state + question + options); 0 = 4096
     int32_t n_threads;      // CPU threads; 0 = hardware default
     bool verbose;           // llama.cpp logs to stderr
+    bool repack;            // CPU weight repacking: faster kernels, but the weights are held twice in RAM (default true)
 } systemone_params;
 
 systemone_params systemone_default_params(void);

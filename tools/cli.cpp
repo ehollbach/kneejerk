@@ -15,9 +15,10 @@
 
 static void usage(const char * argv0) {
     fprintf(stderr,
-            "usage: %s -m MODEL.gguf [-ngl N] [-c N_CTX] [-t THREADS] [--time] [-v]\n"
+            "usage: %s -m MODEL.gguf [-ngl N] [-c N_CTX] [-t THREADS] [--no-repack] [--time] [-v]\n"
             "  reads one JSON request per line from stdin, writes one JSON answer per line\n"
-            "  --time  adds \"_wall_ms\" to every answer\n",
+            "  --time       adds \"_wall_ms\" to every answer\n"
+            "  --no-repack  no repacked copy of the weights: about half the RAM, slower on ARM\n",
             argv0);
 }
 
@@ -42,6 +43,8 @@ int main(int argc, char ** argv) {
             params.n_ctx = (uint32_t) atoi(next("-c"));
         } else if (a == "-t" || a == "--threads") {
             params.n_threads = atoi(next("-t"));
+        } else if (a == "--no-repack") {
+            params.repack = false;
         } else if (a == "--time") {
             time = true;
         } else if (a == "-v" || a == "--verbose") {
