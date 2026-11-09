@@ -34,6 +34,29 @@ of most phones; more threads are often slower.
 iOS: no terminal, so this needs the Swift binding (not written yet). The library builds for
 Metal with `-DGGML_METAL=ON`; the plumbing into an app is the next step, see the README.
 
+Older iPhones build too, CPU only, down to iOS 12 and the A7. Where the device can run a
+command-line binary at all (not on a stock iPhone), cross-compile on a Mac with Xcode:
+
+```bash
+cmake -B build-ios -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_EXE_LINKER_FLAGS=-Wl,-dead_strip \
+  -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a \
+  -DGGML_METAL=OFF -DGGML_ACCELERATE=OFF -DGGML_BLAS=OFF -DGGML_OPENMP=OFF
+cmake --build build-ios --target systemone-cli -j
+codesign -f -s - build-ios/systemone-cli.app/systemone-cli   # ad-hoc signature
+```
+
+- `armv8-a`: the A7 has no dot product and no fp16 arithmetic.
+- `GGML_ACCELERATE=OFF`: ggml asks Accelerate for the new LAPACK headers, which are iOS 16.4 and later.
+- Below iOS 13, `CMakeLists.txt` weak-links libc++. ggml's dynamic backend loader uses
+  `std::filesystem`, which iOS 12's libc++ lacks. The loader never runs when the CPU backend is
+  built in, but its unresolved symbols would stop the binary at launch.
+
+Tested on an iPhone 5s (A7, 1 GB RAM, iOS 12.5.8): the binary launches. With the chat mode of
+the `chat-mode` branch it also loads a 0.7 GB Q2_K Qwen2.5-1.5B (`--no-repack -c 512 -t 2`) and
+generates 5 to 7 seconds per token, probably paging: the model barely fits in RAM next to iOS.
+
 ## Measured so far
 
 | phone | RAM | yes/no, 44 tokens | choice of four, 87 tokens | RSS | threads | date |
