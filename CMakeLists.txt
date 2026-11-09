@@ -15,6 +15,11 @@ set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
+if (NOT EXISTS "${SYSTEMONE_LLAMA_CPP_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "llama.cpp is not checked out at ${SYSTEMONE_LLAMA_CPP_DIR}.\n"
+        "Run:  git submodule update --init --depth 1\n"
+        "or point SYSTEMONE_LLAMA_CPP_DIR at a llama.cpp checkout (release b12207).")
+endif()
 add_subdirectory(${SYSTEMONE_LLAMA_CPP_DIR} ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp EXCLUDE_FROM_ALL)
 
 add_library(systemone
