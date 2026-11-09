@@ -101,8 +101,15 @@ Images, audio and video are not in yet: a request with files gets an error and a
 
 ## Does it run on a phone?
 
-[docs/phone.md](docs/phone.md): the same binary in Termux, timed, before any app is touched.
-Numbers from real phones are what this repo needs most; open an issue with yours.
+Yes. First measurement, 9 November 2026, the binary built in Termux, d1-2B Q4_K_M, four threads:
+
+| phone | RAM | yes/no, 44 tokens | choice of four, 87 tokens | process RSS |
+|---|---|---|---|---|
+| Google Pixel 8a (Tensor G3) | 8 GB | 464 ms | 1 100 ms | 2.1 GB (1.1 GB model mapped + repacked copy); `--no-repack` halves it, timing pending |
+
+Same probabilities as on the desktop to three decimals. Half a second per decision is five times a
+desktop CPU, and still before a message would reach a server. [docs/phone.md](docs/phone.md) has the
+recipe; numbers from other phones are what this repo needs most, open an issue with yours.
 
 ## Parity
 

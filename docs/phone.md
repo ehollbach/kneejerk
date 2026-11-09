@@ -33,3 +33,13 @@ of most phones; more threads are often slower.
 
 iOS: no terminal, so this needs the Swift binding (not written yet). The library builds for
 Metal with `-DGGML_METAL=ON`; the plumbing into an app is the next step, see the README.
+
+## Measured so far
+
+| phone | RAM | yes/no, 44 tokens | choice of four, 87 tokens | RSS | threads | date |
+|---|---|---|---|---|---|---|
+| Google Pixel 8a (Tensor G3) | 8 GB | 464 ms | 1 100 ms | 2.1 GB with repack | 4 | 2026-11-09 |
+
+Notes from that run: Termux needs `pkg upgrade` first (its cmake was newer than its libc++);
+build with `-j2` and `termux-wake-lock`, a full `-j` build got killed; the Hugging Face download
+crawled on the phone, serving the file from a laptop over wifi took minutes.
