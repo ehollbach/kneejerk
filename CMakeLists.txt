@@ -39,6 +39,12 @@ target_include_directories(systemone
 target_link_libraries(systemone PUBLIC llama PRIVATE llama-common mtmd)
 set_target_properties(systemone PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# iOS 12 and older: libc++ has no std::filesystem. ggml links it for the dynamic backend loader, which
+# llama_backend_init() never runs when a backend is built in. Weak-link libc++, so these missing symbols do not stop the launch.
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS" AND CMAKE_OSX_DEPLOYMENT_TARGET AND CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS 13.0)
+    target_link_options(systemone INTERFACE -nostdlib++ "LINKER:-weak-lc++")
+endif()
+
 if (SYSTEMONE_BUILD_CLI)
     add_executable(systemone-cli tools/cli.cpp)
     target_link_libraries(systemone-cli PRIVATE systemone)
