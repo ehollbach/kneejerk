@@ -133,4 +133,5 @@ the server's loop and its `/v1/systemone` handler do around that code: one task 
 variant, the prompt through the model in one batch, the scores read back the way
 `send_decision()` reads them, then `format_answer()`.
 
-llama.cpp is a submodule pinned to b12207. MIT, like llama.cpp.
+llama.cpp is a submodule pinned to b12207. MIT, like llama.cpp. Whether this belongs upstream, in
+`common/` or libllama, is [discussion #31938](https://github.com/ggml-org/llama.cpp/discussions/31938).
