@@ -24,7 +24,8 @@ typedef struct systemone_params {
 
 systemone_params systemone_default_params(void);
 
-// Loads a GGUF decision model. NULL on failure (the message is in systemone_last_error()).
+// Loads a GGUF decision model. NULL on failure, the reason is printed to stderr (there is no handle
+// to ask systemone_last_error() about).
 systemone * systemone_load(const char * model_path, const systemone_params * params);
 void systemone_free(systemone * so);
 
@@ -32,10 +33,14 @@ void systemone_free(systemone * so);
 const char * systemone_model_type(const systemone * so);
 
 // Answers one request. Returns a malloc'd JSON string: {"model", "answers", "usage"} as the server, or
-// {"error": {"message", "type"}}. Free it with systemone_free_string().
+// {"error": {"message", "type"}}. Free it with systemone_free_string(). NULL only if out of memory.
+// Safe to call from several threads on the same handle: requests run one at a time.
 char * systemone_decide(systemone * so, const char * request_json);
 void systemone_free_string(char * s);
 
+// The error JSON of the last systemone_decide() on this handle, "" if it succeeded. The pointer is
+// valid until the next systemone_decide() on the same handle, from any thread: read it from the
+// thread that got the error, before another request can run.
 const char * systemone_last_error(const systemone * so);
 
 #ifdef __cplusplus

@@ -215,8 +215,27 @@ struct systemone {
         return scores;
     }
 
+    // One request, start to end under the mutex, last_error included: two threads deciding on the same
+    // handle must not write last_error at the same time.
     std::string decide(const std::string & request) {
         std::lock_guard<std::mutex> lock(mutex);
+        std::string out;
+        try {
+            out = answer(request);
+        } catch (...) {
+            out = error_json("internal error", "server_error");
+        }
+        if (out.rfind("{\"error\"", 0) == 0) {
+            last_error = out;
+        } else {
+            last_error.clear();
+        }
+        return out;
+    }
+
+private:
+    // called with the mutex held
+    std::string answer(const std::string & request) {
         if (decision.type == COMMON_DECISION_TYPE_NONE) {
             return error_json("This model is not a decision model", "not_supported_error");
         }
@@ -363,17 +382,24 @@ const char * systemone_model_type(const systemone * so) {
 }
 
 char * systemone_decide(systemone * so, const char * request_json) {
+    // nothing may cross the C ABI: an exception escaping here would abort the app
+    static const char fallback[] = "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\"}}";
     std::string out;
-    if (!so || !request_json) {
-        out = error_json("no model or no request", "invalid_request_error");
-    } else {
-        out = so->decide(request_json);
-        if (out.rfind("{\"error\"", 0) == 0) {
-            so->last_error = out;
+    try {
+        if (!so || !request_json) {
+            out = error_json("no model or no request", "invalid_request_error");
+        } else {
+            out = so->decide(request_json);
         }
+    } catch (...) {
+        out.clear();
     }
-    char * s = (char *) malloc(out.size() + 1);
-    memcpy(s, out.c_str(), out.size() + 1);
+    const char * src = out.empty() ? fallback : out.c_str();
+    const size_t n   = out.empty() ? sizeof(fallback) : out.size() + 1;
+    char * s = (char *) malloc(n);
+    if (s) {
+        memcpy(s, src, n);
+    }
     return s;
 }
 
