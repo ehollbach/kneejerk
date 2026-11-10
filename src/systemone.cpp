@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -97,6 +98,8 @@ struct systemone {
     std::unordered_map<llama_token, std::vector<float>> lens_rows;  // rows of the output matrix, dequantized
     std::vector<float> lens_norm_w;                                 // the output norm weight
     const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
+    std::chrono::steady_clock::time_point lens_t0;                  // when the forward pass started
+    std::vector<double> lens_ms;                                    // [n_layer] when each layer's output was ready, ms after t0
 
     // ggml asks before each node whether its data is needed, then calls again once it is computed
     static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
@@ -118,6 +121,7 @@ struct systemone {
         auto & row = so->lens_resid[il];
         row.resize(t->ne[0]);
         ggml_backend_tensor_get(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], t->ne[0] * sizeof(float));
+        so->lens_ms[il] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - so->lens_t0).count();
         return true;
     }
 
@@ -215,10 +219,24 @@ struct systemone {
         info["n_ctx_train"]      = llama_model_n_ctx_train(model);
         info["n_ctx"]            = (int32_t) n_ctx;
         const bool lfm = model->arch == LLM_ARCH_LFM2 || model->arch == LLM_ARCH_LFM3;
+        // bytes of each block's weights in memory, and of everything outside the blocks (embeddings, output)
+        std::vector<int64_t> block_bytes(hp.n_layer(), 0);
+        int64_t other_bytes = 0;
+        for (const auto & [name, t] : model->tensors_by_name) {
+            if (!t) continue;
+            const int64_t bytes = (int64_t) ggml_nbytes(t);
+            if (name.rfind("blk.", 0) == 0) {
+                const uint32_t il = (uint32_t) atoi(name.c_str() + 4);
+                if (il < hp.n_layer()) { block_bytes[il] += bytes; continue; }
+            }
+            other_bytes += bytes;
+        }
+        info["bytes_outside_blocks"] = other_bytes;
         json layers = json::array();
         for (uint32_t il = 0; il < hp.n_layer(); il++) {
             json l = json::object();
-            l["i"] = (int32_t) il;
+            l["i"]     = (int32_t) il;
+            l["bytes"] = block_bytes[il];
             if (hp.is_recr(il)) {
                 l["kind"] = lfm ? "shortconv" : "recurrent";
             } else {
@@ -238,7 +256,7 @@ struct systemone {
 
     // The scores of one task: the prompt through the model in one batch, read as the server reads it.
     // layers, if given, receives the label scores of every layer (empty rows for layers without a readout)
-    std::vector<float> run(const server_task & task, std::vector<std::vector<float>> * layers = nullptr) {
+    std::vector<float> run(const server_task & task, std::vector<std::vector<float>> * layers = nullptr, std::vector<double> * layer_ms = nullptr) {
         const llama_tokens & tokens = task.tokens.tokens;
         const int32_t n_tokens = (int32_t) tokens.size();
         if (n_tokens == 0) {
@@ -288,10 +306,15 @@ struct systemone {
         if (lens) {
             lens_init();
             lens_resid.assign(llama_model_n_layer(model), {});
+            lens_ms.assign(llama_model_n_layer(model), -1.0);
+            lens_t0 = std::chrono::steady_clock::now();
             lens_active = true;
         }
         const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
         lens_active = false;
+        if (lens && layer_ms) {
+            *layer_ms = lens_ms;
+        }
         if (rc != 0) {
             throw std::runtime_error(string_format("llama_process failed (%d)", rc));
         }
@@ -415,7 +438,8 @@ private:
     // the answer of each layer in the shape of the final answer: a row of probabilities per option, or the
     // noul probability; null for a layer without a readout
     json layers_answer(const server_decision_question & question, size_t n_variants, size_t first_task,
-                       const std::vector<std::vector<std::vector<float>>> & layer_results, const std::string & error) const {
+                       const std::vector<std::vector<std::vector<float>>> & layer_results,
+                       const std::vector<std::vector<double>> & layer_ms_results, const std::string & error) const {
         json out = json::object();
         if (!error.empty()) {
             out["error"] = error;
@@ -457,6 +481,12 @@ private:
             }
         }
         out["probabilities"] = rows;
+        // when each layer's output was ready, ms after the forward pass started (first variant)
+        json ms = json::array();
+        for (const double v : layer_ms_results[first_task]) {
+            if (v < 0) ms.push_back(nullptr); else ms.push_back(v);
+        }
+        out["ms"] = ms;
         return out;
     }
 
@@ -498,13 +528,15 @@ private:
             const bool want_layers = json_value(body, "layers", false);
             std::vector<std::vector<float>> results;
             std::vector<std::vector<std::vector<float>>> layer_results; // [task][layer][option]
+            std::vector<std::vector<double>> layer_ms_results;            // [task][layer]
             int32_t n_tokens = 0;
             std::string layers_error;
             for (const auto & task : tasks) {
                 std::vector<std::vector<float>> layers;
+                std::vector<double> ms;
                 if (want_layers && !decision.is_joint() && !task.decision.labels.empty() && !task.decision.pooled) {
                     try {
-                        results.push_back(run(task, &layers));
+                        results.push_back(run(task, &layers, &ms));
                     } catch (const std::exception & e) {
                         layers_error = e.what();
                         results.push_back(run(task));
@@ -516,6 +548,7 @@ private:
                     }
                 }
                 layer_results.push_back(std::move(layers));
+                layer_ms_results.push_back(std::move(ms));
                 n_tokens += task.n_tokens();
             }
 
@@ -538,7 +571,7 @@ private:
                 }
                 json answer = decision.format_answer(question, scores, false);
                 if (want_layers) {
-                    answer["layers"] = layers_answer(question, scores.size(), i_result - scores.size(), layer_results, layers_error);
+                    answer["layers"] = layers_answer(question, scores.size(), i_result - scores.size(), layer_results, layer_ms_results, layers_error);
                 }
                 answers[question.id] = answer;
             }
