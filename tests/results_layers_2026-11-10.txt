@@ -60,3 +60,7 @@ The captured head input (final_norm_out) against the one derived from the head's
 196 tokens, 1003 ms
   refund (noul) final 0.931 · last layer vs final: 0.0005
   team (choice) final billing 0.948 technical 0.025 fraud 0.027 · last layer vs final: 0.0003
+
+== after the no-copy readouts (matrices used in place through ggml_mul_mat, repacked or not), same day
+last layer vs final: d1-2B 0.0000 / 0.0000 (492 ms with layers, the full vocabulary per block), d1-omni 600M 0.0010 / 0.0004 / 0.0000 / 0.0000 (211 ms), Laya 0.0000 (320 ms), H2O Lightning 0.0000 (1521 ms).
+The row-reading readouts crashed on the phone: llama.cpp repacks matmul weights on ARM, and repacked buffers cannot be read, only multiplied.

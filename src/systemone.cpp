@@ -13,6 +13,7 @@
 #include "llama-model.h"   // the output norm and matrix, the layer kinds: for the layer readout and model info
 #include "head-lens.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -99,7 +100,6 @@ struct systemone {
     std::vector<int32_t> lens_pos;                                  // the prompt positions read (the last one, or the option markers)
     int32_t lens_last_base = 0;                                     // layers that only hold the output rows: row = pos - base
     int32_t lens_n_tokens = 0;                                      // rows of a full layer; fewer rows = the output rows only
-    std::unordered_map<llama_token, std::vector<float>> lens_rows;  // rows of the output matrix, dequantized
     std::vector<float> lens_norm_w;                                 // the output norm weight
     const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
     std::unique_ptr<lfm2_head_lens> head_lens;                      // LFM2 d1: the decision head, re-run on every encoder block
@@ -282,19 +282,35 @@ struct systemone {
         lens_out = model->output ? model->output : model->tok_embd; // may be null for a model read from embeddings
     }
 
-    const std::vector<float> & lens_row(llama_token label) {
+    // all logits of one normalised residual through the output matrix: a ggml mul_mat, which works whether or not
+    // llama.cpp repacked the matrix for its fast kernels (reading its rows would not)
+    std::vector<float> lens_logits(const std::vector<float> & h) {
         if (!lens_out) {
             throw std::runtime_error("layer readout: the model has no output matrix");
         }
-        auto it = lens_rows.find(label);
-        if (it == lens_rows.end()) {
-            if (lens_rows.size() > 4096) {
-                lens_rows.clear();
-            }
-            it = lens_rows.emplace(label, std::vector<float>()).first;
-            tensor_row_to_float(lens_out, label, it->second);
+        const int64_t n_vocab = lens_out->ne[1];
+        ggml_init_params ip = { (size_t) (h.size() + n_vocab) * sizeof(float) + 4 * 1024 * 1024, nullptr, false };
+        ggml_context * ctx_l = ggml_init(ip);
+        if (!ctx_l) {
+            throw std::runtime_error("layer readout: out of memory");
         }
-        return it->second;
+        ggml_tensor * x = ggml_new_tensor_1d(ctx_l, GGML_TYPE_F32, h.size());
+        memcpy(x->data, h.data(), h.size() * sizeof(float));
+        ggml_tensor * y = ggml_mul_mat(ctx_l, const_cast<ggml_tensor *>(lens_out), x);
+        ggml_cgraph * gf = ggml_new_graph(ctx_l);
+        ggml_build_forward_expand(gf, y);
+        // the work buffer outside the context: its size depends on the threads and the kernels
+        ggml_cplan plan = ggml_graph_plan(gf, n_threads, nullptr);
+        std::vector<uint8_t> work(plan.work_size + 64);
+        plan.work_data = work.data();
+        const ggml_status st = ggml_graph_compute(gf, &plan);
+        if (st != GGML_STATUS_SUCCESS) {
+            ggml_free(ctx_l);
+            throw std::runtime_error("layer readout: compute failed");
+        }
+        std::vector<float> logits((const float *) y->data, (const float *) y->data + n_vocab);
+        ggml_free(ctx_l);
+        return logits;
     }
 
     // the output norm of the model applied to one residual row: what the head reads
@@ -318,14 +334,13 @@ struct systemone {
     std::vector<float> lens_scores(const std::vector<float> & resid, const std::vector<llama_token> & labels) {
         const size_t n = resid.size();
         const std::vector<float> h = lens_norm(resid.data(), n);
+        const std::vector<float> logits = lens_logits(h);
         std::vector<float> scores;
         for (const llama_token label : labels) {
-            const auto & w = lens_row(label);
-            double dot = 0.0;
-            for (size_t i = 0; i < n; i++) {
-                dot += (double) h[i] * w[i];
+            if (label < 0 || (size_t) label >= logits.size()) {
+                throw std::runtime_error("label token out of the vocabulary");
             }
-            scores.push_back((float) dot);
+            scores.push_back(logits[label]);
         }
         return scores;
     }

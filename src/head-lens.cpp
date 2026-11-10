@@ -37,18 +37,19 @@ lfm2_head_lens::~lfm2_head_lens() {
     }
 }
 
+// a 1-D weight (norms, biases) as a float copy; a matrix stays the model's own tensor: reading its rows is not
+// possible when llama.cpp has repacked it for fast kernels, but ggml_mul_mat on it is, repacked or not
 ggml_tensor * lfm2_head_lens::copy(const ggml_tensor * src, ggml_type type) {
     if (!src) {
         return nullptr;
     }
+    if (type != GGML_TYPE_F32) {
+        return const_cast<ggml_tensor *>(src);
+    }
     std::vector<float> f;
     read_rows(src, f);
     ggml_tensor * t = ggml_new_tensor_2d(ctx_w, type, src->ne[0], ggml_nrows(src));
-    if (type == GGML_TYPE_F32) {
-        memcpy(t->data, f.data(), f.size() * sizeof(float));
-    } else {
-        ggml_fp32_to_fp16_row(f.data(), (ggml_fp16_t *) t->data, f.size());
-    }
+    memcpy(t->data, f.data(), f.size() * sizeof(float));
     return t;
 }
 
@@ -69,7 +70,7 @@ bool lfm2_head_lens::init(const llama_model * model) {
     eps_ln      = hp.f_norm_eps;
     eps_rms     = hp.f_norm_rms_eps;
 
-    // room for the half-precision copies of every head weight
+    // room for the float copies of the vectors (the matrices stay the model's)
     size_t bytes = 1024 * 1024;
     for (int il = n_layer_enc; il < n_layer; il++) {
         const auto & l = model->layers[il];
@@ -77,7 +78,7 @@ bool lfm2_head_lens::init(const llama_model * model) {
             if (!t) {
                 return false;
             }
-            bytes += ggml_nelements(t) * 4 + 256;
+            if (ggml_n_dims(t) == 1) bytes += ggml_nelements(t) * 4 + 256;
         }
     }
     for (const ggml_tensor * t : {model->output_norm, model->type_embd, model->cls_norm, model->cls_norm_b, model->cls, model->cls_b, model->cls_out, model->cls_out_b}) {
@@ -181,7 +182,10 @@ std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, co
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
     ggml_build_forward_expand(gf, s);
-    const ggml_status st = ggml_graph_compute_with_ctx(ctx, gf, n_threads > 0 ? n_threads : 4);
+    ggml_cplan plan = ggml_graph_plan(gf, n_threads > 0 ? n_threads : 4, nullptr);
+    std::vector<uint8_t> work(plan.work_size + 64);
+    plan.work_data = work.data();
+    const ggml_status st = ggml_graph_compute(gf, &plan);
     if (st != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);
         throw std::runtime_error("head lens: compute failed");
