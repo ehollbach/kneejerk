@@ -344,6 +344,53 @@ struct systemone {
         return h;
     }
 
+    // the output-embedding projection some models apply after the norm (qwen35 / kev: cls_out, [n_embd -> n_embd_out]),
+    // on many rows at once, in place through ggml_mul_mat. Without such a projection the rows pass through.
+    std::vector<std::vector<float>> lens_project(const std::vector<std::vector<float>> & hs) {
+        const ggml_tensor * w = model->cls_out;
+        if (!w) {
+            return hs;
+        }
+        const int64_t n_in = w->ne[0], n_out = w->ne[1], n_rows = (int64_t) hs.size();
+        ggml_init_params ip = { (size_t) n_rows * (n_in + n_out) * sizeof(float) + (size_t) n_out * sizeof(float) + 4 * 1024 * 1024, nullptr, false };
+        ggml_context * ctx_p = ggml_init(ip);
+        if (!ctx_p) {
+            throw std::runtime_error("layer readout: out of memory");
+        }
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_p, GGML_TYPE_F32, n_in, n_rows);
+        for (int64_t r = 0; r < n_rows; r++) {
+            if ((int64_t) hs[r].size() != n_in) {
+                ggml_free(ctx_p);
+                throw std::runtime_error("layer readout: residual width does not match the projection");
+            }
+            memcpy((float *) x->data + r * n_in, hs[r].data(), n_in * sizeof(float));
+        }
+        ggml_tensor * y = ggml_mul_mat(ctx_p, const_cast<ggml_tensor *>(w), x);
+        if (model->cls_out_b) {
+            std::vector<float> b;
+            tensor_row_to_float(model->cls_out_b, 0, b);
+            ggml_tensor * bt = ggml_new_tensor_1d(ctx_p, GGML_TYPE_F32, n_out);
+            memcpy(bt->data, b.data(), n_out * sizeof(float));
+            y = ggml_add(ctx_p, y, bt);
+        }
+        ggml_cgraph * gf = ggml_new_graph(ctx_p);
+        ggml_build_forward_expand(gf, y);
+        ggml_cplan plan = ggml_graph_plan(gf, n_threads, threadpool);
+        std::vector<uint8_t> work(plan.work_size + 64);
+        plan.work_data = work.data();
+        if (ggml_graph_compute(gf, &plan) != GGML_STATUS_SUCCESS) {
+            ggml_free(ctx_p);
+            throw std::runtime_error("layer readout: compute failed");
+        }
+        std::vector<std::vector<float>> out(n_rows);
+        for (int64_t r = 0; r < n_rows; r++) {
+            const float * row = (const float *) ((const char *) y->data + r * y->nb[1]);
+            out[r].assign(row, row + n_out);
+        }
+        ggml_free(ctx_p);
+        return out;
+    }
+
     // the label logits every layer's residual would give through the output head: the norm, then the matrix,
     // all layers in one matmul. Empty residuals give empty rows.
     std::vector<std::vector<float>> lens_scores_all(const std::vector<std::vector<float>> & resids, const std::vector<llama_token> & labels) {
@@ -548,6 +595,11 @@ struct systemone {
         // the readout re-runs the head on the residual after every encoder block (head-lens.cpp)
         const bool marker_readout = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0;
         const bool lens_markers = marker_readout && model->hparams.n_layer_decision == 0;
+        // pointer readout (kev): the embedding at the question's position dotted with each option's, two halves
+        const bool lens_pointer = d.labels.empty() && !d.markers.empty() && d.pointer >= 0 && !d.pooled && d.n_scores == 0 &&
+                                  model->hparams.n_layer_decision == 0 &&
+                                  (model->cls_out ? model->cls_out->ne[1] == llama_model_n_embd_out(model)
+                                                  : llama_model_n_embd_out(model) == llama_model_n_embd(model));
         bool lens_head = false;
         const bool bert = model->arch == LLM_ARCH_MODERN_BERT;
         if (layers != nullptr && marker_readout && model->hparams.n_layer_decision > 0 && n_tokens <= LENS_MAX_TOKENS) {
@@ -560,10 +612,13 @@ struct systemone {
             }
             lens_head = head_lens != nullptr;
         }
-        const bool lens = layers != nullptr && (lens_labels || lens_markers || lens_head);
+        const bool lens = layers != nullptr && (lens_labels || lens_markers || lens_head || lens_pointer);
         if (lens) {
             lens_init();
             lens_pos = lens_labels ? std::vector<int32_t>{n_tokens - 1} : d.markers;
+            if (lens_pointer) {
+                lens_pos.push_back(d.pointer); // the question's position last
+            }
             lens_n_tokens = n_tokens;
             lens_last_base = n_tokens - 1;
             for (int32_t i = 0; i < n_tokens; i++) { // the first position with an output: row 0 of the last layer
@@ -606,6 +661,40 @@ struct systemone {
             layers->clear();
             const int n_layer_enc = (int) llama_model_n_layer(model) - (int) model->hparams.n_layer_decision;
             const auto label_scores = lens_labels ? lens_scores_all(lens_resid, d.labels) : std::vector<std::vector<float>>();
+            // pointer: every layer's rows (markers, then the pointer) normalised and projected in one go, then
+            // as send_decision() reads it: q = the first half at the pointer, k = the second half at each marker
+            std::vector<std::vector<float>> pointer_scores(lens_resid.size());
+            if (lens_pointer) {
+                const size_t n_pos = lens_pos.size();
+                std::vector<std::vector<float>> hs;
+                std::vector<size_t> which;
+                for (size_t il = 0; il < lens_resid.size(); il++) {
+                    const auto & r = lens_resid[il];
+                    if (r.empty()) continue;
+                    const size_t n_embd = r.size() / n_pos;
+                    for (size_t k = 0; k < n_pos; k++) {
+                        hs.push_back(lens_norm(r.data() + k * n_embd, n_embd));
+                    }
+                    which.push_back(il);
+                }
+                if (!hs.empty()) {
+                    const auto es = lens_project(hs);
+                    const size_t n_out = es[0].size(), n_ptr = n_out / 2;
+                    for (size_t j = 0; j < which.size(); j++) {
+                        const auto & eq = es[j * n_pos + n_pos - 1];
+                        std::vector<float> scores;
+                        for (size_t k = 0; k + 1 < n_pos; k++) {
+                            const auto & ek = es[j * n_pos + k];
+                            double dot = 0.0;
+                            for (size_t i = 0; i < n_ptr; i++) {
+                                dot += (double) eq[i] * ek[n_ptr + i];
+                            }
+                            scores.push_back((float) (dot / sqrt((double) n_ptr)));
+                        }
+                        pointer_scores[which[j]] = std::move(scores);
+                    }
+                }
+            }
             for (size_t il = 0; il < lens_resid.size(); il++) {
                 const auto & resid = lens_resid[il];
                 if (lens_head) {
@@ -620,6 +709,8 @@ struct systemone {
                     layers->push_back({});
                 } else if (lens_labels) {
                     layers->push_back(pool_groups(label_scores[il], d.label_groups));
+                } else if (lens_pointer) {
+                    layers->push_back(pointer_scores[il]);
                 } else {
                     // markers: the embedding column of each option, as send_decision() reads it from the final embeddings
                     const size_t n_embd = resid.size() / lens_pos.size();
@@ -917,8 +1008,8 @@ private:
                 std::vector<double> ms;
                 lens_tokens_result per_token;
                 const auto & td = task.decision;
-                const bool lens_possible = !decision.is_joint() && !td.pooled &&
-                    (!td.labels.empty() || (!td.markers.empty() && td.pointer < 0 && td.n_scores == 0));
+                const bool lens_possible = !decision.is_joint() && !td.pooled && td.n_scores == 0 &&
+                    (!td.labels.empty() || !td.markers.empty());
                 if (want_layers && lens_possible) {
                     try {
                         results.push_back(run(task, &layers, &ms, &per_token));
@@ -932,7 +1023,7 @@ private:
                 } else {
                     results.push_back(run(task));
                     if (want_layers && layers_error.empty()) {
-                        layers_error = "layer readout is not available for models read from a pooled embedding or a pointer (Laya, kev, ...)";
+                        layers_error = "layer readout is not available for models read from a pooled embedding";
                     }
                 }
                 layer_results.push_back(std::move(layers));

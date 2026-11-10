@@ -64,3 +64,7 @@ The captured head input (final_norm_out) against the one derived from the head's
 == after the no-copy readouts (matrices used in place through ggml_mul_mat, repacked or not), same day
 last layer vs final: d1-2B 0.0000 / 0.0000 (492 ms with layers, the full vocabulary per block), d1-omni 600M 0.0010 / 0.0004 / 0.0000 / 0.0000 (211 ms), Laya 0.0000 (320 ms), H2O Lightning 0.0000 (1521 ms).
 The row-reading readouts crashed on the phone: llama.cpp repacks matmul weights on ARM, and repacked buffers cannot be read, only multiplied.
+
+== vllm-d3-edge-Q8_0 (label codes, logit lens): last layer vs final 0.0000 on all four questions (233 / 176 ms with layers)
+== Kev-0.8B-Q8_0 (qwen35, pointer readout: the norm, the cls_out projection to 512, q at the question's position dotted with k at each option): last layer vs final 0.0000 on all four (241 / 159 ms)
+All six families in probascope now reproduce their own answer on the last block to 0.0000 (d1-omni 600M to 0.0010, half-precision head copies no longer used, the head runs in place).
