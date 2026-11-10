@@ -20,6 +20,7 @@ typedef struct systemone_params {
     int32_t n_threads;      // CPU threads; 0 = hardware default
     bool verbose;           // llama.cpp logs to stderr
     bool repack;            // CPU weight repacking: faster kernels, but the weights are held twice in RAM (default true)
+    bool flash_attn;        // fused attention (default true); false materialises the attention maps, which "layers" then returns
 } systemone_params;
 
 systemone_params systemone_default_params(void);
@@ -36,7 +37,10 @@ const char * systemone_model_type(const systemone * so);
 // an extension of this library: "layers": true in the request adds to every answer the answer each layer
 // would give (the residual stream after the layer through the output head, a logit lens): {"options",
 // "probabilities": [[per option] per layer], "ms": [when each layer was done]} or [noul per layer].
-// Label-token models only (d1, ...).
+// Label-token models only (d1, ...). Prompts up to 512 tokens also get "tokens" (the prompt as the model
+// reads it, one piece per token), "token_change": [[per token] per layer] (how much each layer moved each
+// token, 0..1 within the layer) and, with flash_attn off, "attention": {"<layer>": [[per token] per head]}
+// (where the last position looked, every head).
 // Returns a malloc'd JSON string: {"model", "answers", "usage"} as the server, or
 // {"error": {"message", "type"}}. Free it with systemone_free_string(). NULL only if out of memory.
 // Safe to call from several threads on the same handle: requests run one at a time.

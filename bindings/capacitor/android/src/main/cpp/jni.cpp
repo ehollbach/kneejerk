@@ -50,6 +50,7 @@ Java_com_moudrkat_kneejerk_Kneejerk_nativeLoad(JNIEnv * env, jclass, jstring pat
     p.n_threads    = threads;
     p.n_ctx        = n_ctx > 0 ? (uint32_t) n_ctx : 4096;
     p.repack       = repack == JNI_TRUE;
+    p.flash_attn   = false;          // the attention maps are part of what the app shows
     const std::string file = from_java(env, path);
     LOGI("loading %s (threads %d, n_ctx %u, repack %d)", file.c_str(), p.n_threads, p.n_ctx, (int) p.repack);
     systemone * so = systemone_load(file.c_str(), &p);

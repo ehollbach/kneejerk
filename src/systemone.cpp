@@ -101,6 +101,13 @@ struct systemone {
     std::chrono::steady_clock::time_point lens_t0;                  // when the forward pass started
     std::vector<double> lens_ms;                                    // [n_layer] when each layer's output was ready, ms after t0
     double lens_process_ms = 0, lens_readout_ms = 0;                // the forward pass, and the lens arithmetic after it
+    // per token, for prompts up to LENS_MAX_TOKENS: the whole residual stream after each layer, the input embeddings,
+    // and the attention of the last position (only without flash attention, where the softmax exists as a tensor)
+    static constexpr int32_t LENS_MAX_TOKENS = 512;
+    bool lens_tokens = false;
+    std::vector<std::vector<float>> lens_full;                      // [n_layer][n_tokens * n_embd]
+    std::vector<float> lens_inp;                                    // [n_tokens * n_embd]
+    std::unordered_map<int, std::vector<std::vector<float>>> lens_attn; // [il] -> [head][n_kv], the last query row of every head
 
     // ggml asks before each node whether its data is needed, then calls again once it is computed
     static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
@@ -109,20 +116,50 @@ struct systemone {
             return !ask;
         }
         const char * name = ggml_get_name(t);
-        if (strncmp(name, "l_out-", 6) != 0) {
+        const bool is_l_out = strncmp(name, "l_out-", 6) == 0;
+        const bool is_inp   = so->lens_tokens && strcmp(name, "inp_embd") == 0;
+        const bool is_attn  = so->lens_tokens && strncmp(name, "kq_soft_max-", 12) == 0;
+        if (!is_l_out && !is_inp && !is_attn) {
             return !ask;
         }
         if (ask) {
             return true;
         }
+        if (t->type != GGML_TYPE_F32) {
+            return true;
+        }
+        if (is_inp) {
+            so->lens_inp.resize(t->ne[0] * t->ne[1]);
+            ggml_backend_tensor_get(t, so->lens_inp.data(), 0, so->lens_inp.size() * sizeof(float));
+            return true;
+        }
+        if (is_attn) {
+            // [n_kv, n_q, n_head]: the last query row of every head, averaged
+            const int il = atoi(name + 12);
+            const int64_t n_kv = t->ne[0], n_q = t->ne[1], n_head = t->ne[2];
+            if (n_q < 1 || n_head < 1) {
+                return true;
+            }
+            std::vector<std::vector<float>> heads(n_head, std::vector<float>(n_kv));
+            for (int64_t h = 0; h < n_head; h++) {
+                ggml_backend_tensor_get(t, heads[h].data(), (size_t) (n_q - 1) * t->nb[1] + (size_t) h * t->nb[2], n_kv * sizeof(float));
+            }
+            so->lens_attn[il] = std::move(heads);
+            return true;
+        }
         const int il = atoi(name + 6);
-        if (il < 0 || il >= (int) so->lens_resid.size() || t->type != GGML_TYPE_F32 || t->ne[1] < 1) {
+        if (il < 0 || il >= (int) so->lens_resid.size() || t->ne[1] < 1) {
             return true;
         }
         auto & row = so->lens_resid[il];
         row.resize(t->ne[0]);
         ggml_backend_tensor_get(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], t->ne[0] * sizeof(float));
         so->lens_ms[il] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - so->lens_t0).count();
+        if (so->lens_tokens && il < (int) so->lens_full.size()) {
+            auto & full = so->lens_full[il];
+            full.resize(t->ne[0] * t->ne[1]);
+            ggml_backend_tensor_get(t, full.data(), 0, full.size() * sizeof(float));
+        }
         return true;
     }
 
@@ -179,6 +216,51 @@ struct systemone {
             scores.push_back((float) dot);
         }
         return scores;
+    }
+
+    // what the per-token capture of one task turns into
+    struct lens_tokens_result {
+        std::vector<std::string> pieces;                       // the prompt as the model reads it
+        std::vector<std::vector<float>> change;                // [layer][token] 0..1, how much the layer moved the token
+        std::unordered_map<int, std::vector<std::vector<float>>> attention; // [layer][head][token], where the last position looked
+    };
+
+    // ||after - before|| per token for each layer, scaled to the layer's largest move
+    lens_tokens_result lens_token_readout(const llama_tokens & tokens) {
+        lens_tokens_result out;
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        for (const llama_token t : tokens) {
+            out.pieces.push_back(common_token_to_piece(vocab, t, true));
+        }
+        const int64_t n_tokens = (int64_t) tokens.size();
+        const std::vector<float> * prev = lens_inp.empty() ? nullptr : &lens_inp;
+        for (const auto & full : lens_full) {
+            std::vector<float> change(n_tokens, 0.0f);
+            if (!full.empty() && prev && prev->size() == full.size() && full.size() % n_tokens == 0) {
+                const int64_t n_embd = (int64_t) full.size() / n_tokens;
+                float max_v = 0.0f;
+                for (int64_t t = 0; t < n_tokens; t++) {
+                    double ss = 0.0;
+                    for (int64_t i = 0; i < n_embd; i++) {
+                        const double d = (double) full[t * n_embd + i] - (double) (*prev)[t * n_embd + i];
+                        ss += d * d;
+                    }
+                    change[t] = (float) sqrt(ss);
+                    max_v = std::max(max_v, change[t]);
+                }
+                if (max_v > 0) {
+                    for (auto & v : change) v /= max_v;
+                }
+            }
+            out.change.push_back(std::move(change));
+            if (!full.empty()) prev = &full;
+        }
+        for (auto & [il, heads] : lens_attn) {
+            if (!heads.empty() && (int64_t) heads[0].size() == n_tokens) {
+                out.attention[il] = heads;
+            }
+        }
+        return out;
     }
 
     static std::vector<float> pool_groups(std::vector<float> scores, const std::vector<int32_t> & groups) {
@@ -257,7 +339,8 @@ struct systemone {
 
     // The scores of one task: the prompt through the model in one batch, read as the server reads it.
     // layers, if given, receives the label scores of every layer (empty rows for layers without a readout)
-    std::vector<float> run(const server_task & task, std::vector<std::vector<float>> * layers = nullptr, std::vector<double> * layer_ms = nullptr) {
+    std::vector<float> run(const server_task & task, std::vector<std::vector<float>> * layers = nullptr, std::vector<double> * layer_ms = nullptr,
+                           lens_tokens_result * per_token = nullptr) {
         const llama_tokens & tokens = task.tokens.tokens;
         const int32_t n_tokens = (int32_t) tokens.size();
         if (n_tokens == 0) {
@@ -308,6 +391,10 @@ struct systemone {
             lens_init();
             lens_resid.assign(llama_model_n_layer(model), {});
             lens_ms.assign(llama_model_n_layer(model), -1.0);
+            lens_tokens = per_token != nullptr && n_tokens <= LENS_MAX_TOKENS;
+            lens_full.assign(lens_tokens ? llama_model_n_layer(model) : 0, {});
+            lens_inp.clear();
+            lens_attn.clear();
             lens_t0 = std::chrono::steady_clock::now();
             lens_active = true;
         }
@@ -329,6 +416,13 @@ struct systemone {
                 layers->push_back(resid.empty() ? std::vector<float>() : pool_groups(lens_scores(resid, d.labels), d.label_groups));
             }
             lens_resid.clear();
+            if (lens_tokens && per_token) {
+                *per_token = lens_token_readout(tokens);
+            }
+            lens_full.clear();
+            lens_inp.clear();
+            lens_attn.clear();
+            lens_tokens = false;
             lens_readout_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_readout).count();
         }
 
@@ -445,7 +539,8 @@ private:
     // noul probability; null for a layer without a readout
     json layers_answer(const server_decision_question & question, size_t n_variants, size_t first_task,
                        const std::vector<std::vector<std::vector<float>>> & layer_results,
-                       const std::vector<std::vector<double>> & layer_ms_results, const std::string & error) const {
+                       const std::vector<std::vector<double>> & layer_ms_results,
+                       const std::vector<lens_tokens_result> & token_results, const std::string & error) const {
         json out = json::object();
         if (!error.empty()) {
             out["error"] = error;
@@ -497,6 +592,32 @@ private:
         timings["forward_ms"] = lens_process_ms;
         timings["readout_ms"] = lens_readout_ms;
         out["timings"] = timings;
+        const auto & tk = token_results[first_task];
+        if (!tk.pieces.empty()) {
+            json pieces = json::array();
+            for (const auto & p : tk.pieces) pieces.push_back(p);
+            out["tokens"] = pieces;
+            json change = json::array();
+            for (const auto & layer : tk.change) {
+                json row = json::array();
+                for (const float v : layer) row.push_back((double) v);
+                change.push_back(row);
+            }
+            out["token_change"] = change;
+            if (!tk.attention.empty()) {
+                json attn = json::object();
+                for (const auto & [il, heads] : tk.attention) {
+                    json hs = json::array();
+                    for (const auto & head : heads) {
+                        json r = json::array();
+                        for (const float v : head) r.push_back((double) v);
+                        hs.push_back(r);
+                    }
+                    attn[std::to_string(il)] = hs;
+                }
+                out["attention"] = attn;
+            }
+        }
         return out;
     }
 
@@ -539,14 +660,16 @@ private:
             std::vector<std::vector<float>> results;
             std::vector<std::vector<std::vector<float>>> layer_results; // [task][layer][option]
             std::vector<std::vector<double>> layer_ms_results;            // [task][layer]
+            std::vector<lens_tokens_result> token_results;                 // [task]
             int32_t n_tokens = 0;
             std::string layers_error;
             for (const auto & task : tasks) {
                 std::vector<std::vector<float>> layers;
                 std::vector<double> ms;
+                lens_tokens_result per_token;
                 if (want_layers && !decision.is_joint() && !task.decision.labels.empty() && !task.decision.pooled) {
                     try {
-                        results.push_back(run(task, &layers, &ms));
+                        results.push_back(run(task, &layers, &ms, &per_token));
                     } catch (const std::exception & e) {
                         layers_error = e.what();
                         results.push_back(run(task));
@@ -559,6 +682,7 @@ private:
                 }
                 layer_results.push_back(std::move(layers));
                 layer_ms_results.push_back(std::move(ms));
+                token_results.push_back(std::move(per_token));
                 n_tokens += task.n_tokens();
             }
 
@@ -581,7 +705,7 @@ private:
                 }
                 json answer = decision.format_answer(question, scores, false);
                 if (want_layers) {
-                    answer["layers"] = layers_answer(question, scores.size(), i_result - scores.size(), layer_results, layer_ms_results, layers_error);
+                    answer["layers"] = layers_answer(question, scores.size(), i_result - scores.size(), layer_results, layer_ms_results, token_results, layers_error);
                 }
                 answers[question.id] = answer;
             }
@@ -611,6 +735,7 @@ systemone_params systemone_default_params(void) {
     p.n_threads    = 0;
     p.verbose      = false;
     p.repack       = true;
+    p.flash_attn   = true;
     return p;
 }
 
@@ -642,7 +767,7 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     cparams.cb_eval           = systemone::cb_eval; // only reads when a request asks for layers
     cparams.cb_eval_user_data = so.get();
     cparams.no_perf   = true;
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.flash_attn_type = params.flash_attn ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     if (params.n_threads > 0) {
         cparams.n_threads       = params.n_threads;
         cparams.n_threads_batch = params.n_threads;
