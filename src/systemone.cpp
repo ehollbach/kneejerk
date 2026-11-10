@@ -575,7 +575,10 @@ struct systemone {
             }
             lens_resid.assign(llama_model_n_layer(model), {});
             lens_ms.assign(llama_model_n_layer(model), -1.0);
-            lens_tokens = (per_token != nullptr || lens_head) && n_tokens <= LENS_MAX_TOKENS;
+            // per-token capture only within a budget: all blocks times all tokens times the width, in floats
+            const size_t budget_floats = 64u * 1024u * 1024u / sizeof(float);
+            const size_t need_floats   = (size_t) llama_model_n_layer(model) * n_tokens * llama_model_n_embd(model);
+            lens_tokens = (per_token != nullptr || lens_head) && n_tokens <= LENS_MAX_TOKENS && need_floats <= budget_floats;
             lens_bert = bert && lens_tokens;
             lens_full.assign(lens_tokens ? llama_model_n_layer(model) : 0, {});
             lens_full_normed.assign(lens_full.size(), false);
@@ -969,7 +972,7 @@ private:
             out["model"]   = model_name;
             out["answers"] = answers;
             out["usage"]   = usage;
-            return out.dump();
+            return out.dump_safe();
         } catch (const std::invalid_argument & e) {
             return error_json(e.what(), "invalid_request_error");
         } catch (const std::exception & e) {

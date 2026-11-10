@@ -30,6 +30,10 @@ export class KneejerkWeb extends WebPlugin implements KneejerkPlugin {
     return { response: await r.text(), wallMs: performance.now() - t0 }
   }
 
+  async memory(): Promise<{ availMem: number; totalMem: number; lowMemory: boolean }> {
+    return { availMem: 0, totalMem: 0, lowMemory: false }
+  }
+
   async modelInfo(): Promise<{ info: string }> {
     throw new Error('modelInfo is only available natively')
   }

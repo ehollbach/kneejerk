@@ -73,6 +73,19 @@ public class KneejerkPlugin extends Plugin {
         });
     }
 
+    /** Free and total RAM in bytes, so an app can decide whether a model fits (with repacking it takes about twice its file). */
+    @PluginMethod
+    public void memory(PluginCall call) {
+        android.app.ActivityManager am = (android.app.ActivityManager) getContext().getSystemService(android.content.Context.ACTIVITY_SERVICE);
+        android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+        am.getMemoryInfo(mi);
+        JSObject ret = new JSObject();
+        ret.put("availMem", mi.availMem);
+        ret.put("totalMem", mi.totalMem);
+        ret.put("lowMemory", mi.lowMemory);
+        call.resolve(ret);
+    }
+
     @PluginMethod
     public void modelInfo(PluginCall call) {
         worker.execute(() -> {

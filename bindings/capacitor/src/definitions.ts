@@ -37,6 +37,8 @@ export interface KneejerkPlugin {
   /** Answers one request. Rejects when no model is loaded. */
   decide(options: DecideOptions): Promise<DecideResult>
   /** Frees the model and its memory. */
+  /** Free and total RAM in bytes; a model with repacking takes about twice its file size. */
+  memory(): Promise<{ availMem: number; totalMem: number; lowMemory: boolean }>
   /** What the model is made of: architecture, sizes, one entry per layer (JSON text, see systemone_model_info). */
   modelInfo(): Promise<{ info: string }>
   unload(): Promise<void>
