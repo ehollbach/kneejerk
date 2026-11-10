@@ -96,7 +96,8 @@ struct systemone {
     bool lens_active = false;
     std::vector<std::vector<float>> lens_resid;                     // [n_layer][n_pos * n_embd], empty if the layer was not seen
     std::vector<int32_t> lens_pos;                                  // the prompt positions read (the last one, or the option markers)
-    int32_t lens_last_base = 0;                                     // the last layer only has the output rows: row = pos - base
+    int32_t lens_last_base = 0;                                     // layers that only hold the output rows: row = pos - base
+    int32_t lens_n_tokens = 0;                                      // rows of a full layer; fewer rows = the output rows only
     std::unordered_map<llama_token, std::vector<float>> lens_rows;  // rows of the output matrix, dequantized
     std::vector<float> lens_norm_w;                                 // the output norm weight
     const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
@@ -153,13 +154,14 @@ struct systemone {
         if (il < 0 || il >= (int) so->lens_resid.size() || t->ne[1] < 1) {
             return true;
         }
-        const bool last = il == (int) so->lens_resid.size() - 1;
+        // the last layer, and in a decision head every layer, keeps only the output positions
+        const bool reduced = t->ne[1] < so->lens_n_tokens;
         const int64_t n_embd = t->ne[0];
         auto & rows = so->lens_resid[il];
         rows.assign(so->lens_pos.size() * n_embd, 0.0f);
         bool ok = true;
         for (size_t k = 0; k < so->lens_pos.size(); k++) {
-            const int64_t row = last ? so->lens_pos[k] - so->lens_last_base : so->lens_pos[k];
+            const int64_t row = reduced ? so->lens_pos[k] - so->lens_last_base : so->lens_pos[k];
             if (row < 0 || row >= t->ne[1]) {
                 ok = false;
                 break;
@@ -170,7 +172,7 @@ struct systemone {
             rows.clear();
         }
         so->lens_ms[il] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - so->lens_t0).count();
-        if (so->lens_tokens && il < (int) so->lens_full.size()) {
+        if (so->lens_tokens && !reduced && il < (int) so->lens_full.size()) {
             auto & full = so->lens_full[il];
             full.resize(t->ne[0] * t->ne[1]);
             ggml_backend_tensor_get(t, full.data(), 0, full.size() * sizeof(float));
@@ -413,6 +415,7 @@ struct systemone {
         if (lens) {
             lens_init();
             lens_pos = lens_labels ? std::vector<int32_t>{n_tokens - 1} : d.markers;
+            lens_n_tokens = n_tokens;
             lens_last_base = n_tokens - 1;
             for (int32_t i = 0; i < n_tokens; i++) { // the first position with an output: row 0 of the last layer
                 if ((!d.labels.empty() && i == n_tokens - 1) ||
