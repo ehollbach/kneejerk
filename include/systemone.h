@@ -33,9 +33,19 @@ void systemone_free(systemone * so);
 const char * systemone_model_type(const systemone * so);
 
 // Answers one request. Returns a malloc'd JSON string: {"model", "answers", "usage"} as the server, or
+// an extension of this library: "layers": true in the request adds to every answer the answer each layer
+// would give (the residual stream after the layer through the output head, a logit lens): {"options",
+// "probabilities": [[per option] per layer]} or [noul per layer]. Label-token models only (d1, ...).
+// Returns a malloc'd JSON string: {"model", "answers", "usage"} as the server, or
 // {"error": {"message", "type"}}. Free it with systemone_free_string(). NULL only if out of memory.
 // Safe to call from several threads on the same handle: requests run one at a time.
 char * systemone_decide(systemone * so, const char * request_json);
+
+// What the model is made of, as a malloc'd JSON string: architecture, sizes, and one entry per layer with
+// its kind ("shortconv", "attention", ...) and whether it belongs to the decision head. Free with
+// systemone_free_string().
+char * systemone_model_info(const systemone * so);
+
 void systemone_free_string(char * s);
 
 // The error JSON of the last systemone_decide() on this handle, "" if it succeeded. The pointer is

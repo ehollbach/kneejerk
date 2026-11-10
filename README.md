@@ -67,8 +67,25 @@ systemone_free_string(answer);
 systemone_free(so);
 ```
 
-Link `libsystemone` (it brings `llama` with it). Six functions, C ABI, so Swift, Kotlin/JNI,
-Dart and Rust bindings are thin. The Capacitor plugin that started this comes next.
+Link `libsystemone` (it brings `llama` with it). Seven functions, C ABI, so Swift, Kotlin/JNI,
+Dart and Rust bindings are thin. The Capacitor plugin is `bindings/capacitor`
+(`load`, `decide`, `modelInfo`, `unload`; Android, arm64), used by
+[probascope](https://github.com/moudrkat/probascope).
+
+## Look inside
+
+Two things llama-server does not do, because an app that holds the model can:
+
+- `"layers": true` in the request adds to every answer the answer each layer would give: the
+  residual stream after the layer, through the model's own output norm and output matrix,
+  restricted to the label tokens, then the same softmax as the final answer. A logit lens, from
+  the same forward pass. `{"options": [...], "probabilities":
+  [[per option] per layer]}`, or `[noul per layer]`. Models that read their answer from label
+  tokens only (d1, lev, pplx-decider, ...); pooled-embedding models (Laya, kev) get an error
+  field instead. `tests/layers.py` prints the table, and how far the last layer is from the answer.
+- `systemone_model_info()` (CLI: `--info`) says what the model is made of: architecture,
+  sizes, and every block with its kind (short convolution, attention, sliding-window attention)
+  and whether it belongs to the decision head, from the GGUF.
 
 ## Which models
 

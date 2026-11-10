@@ -10,7 +10,10 @@
 
 #include "server-decision.h"
 #include "llama-ext.h"
+#include "llama-model.h"   // the output norm and matrix, the layer kinds: for the layer readout and model info
+#include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -47,6 +51,24 @@ const char * decision_type_name(common_decision_type type) {
 
 void quiet_log(ggml_log_level, const char *, void *) {}
 
+// one row of a weight tensor as floats, whatever its type and wherever it lives
+void tensor_row_to_float(const ggml_tensor * t, int64_t row, std::vector<float> & out) {
+    const int64_t n = t->ne[0];
+    out.resize(n);
+    const size_t row_bytes = ggml_row_size(t->type, n);
+    std::vector<uint8_t> buf(row_bytes);
+    ggml_backend_tensor_get(t, buf.data(), (size_t) row * t->nb[1], row_bytes);
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(out.data(), buf.data(), n * sizeof(float));
+        return;
+    }
+    const auto * traits = ggml_get_type_traits(t->type);
+    if (!traits || !traits->to_float) {
+        throw std::runtime_error(std::string("cannot read a ") + ggml_type_name(t->type) + " tensor");
+    }
+    traits->to_float(buf.data(), out.data(), n);
+}
+
 std::string error_json(const std::string & message, const char * type) {
     json err = json::object();
     err["message"] = message;
@@ -68,13 +90,155 @@ struct systemone {
     uint32_t n_ctx = 0;
     std::mutex mutex; // one request at a time: the context is shared
 
+    // Layer readout (a logit lens): the residual stream at the last prompt position after each layer,
+    // read through the model's own output norm and output matrix, restricted to the label tokens.
+    bool lens_active = false;
+    std::vector<std::vector<float>> lens_resid;                     // [n_layer][n_embd], empty if the layer was not seen
+    std::unordered_map<llama_token, std::vector<float>> lens_rows;  // rows of the output matrix, dequantized
+    std::vector<float> lens_norm_w;                                 // the output norm weight
+    const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
+
+    // ggml asks before each node whether its data is needed, then calls again once it is computed
+    static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+        auto * so = static_cast<systemone *>(user_data);
+        if (!so->lens_active) {
+            return !ask;
+        }
+        const char * name = ggml_get_name(t);
+        if (strncmp(name, "l_out-", 6) != 0) {
+            return !ask;
+        }
+        if (ask) {
+            return true;
+        }
+        const int il = atoi(name + 6);
+        if (il < 0 || il >= (int) so->lens_resid.size() || t->type != GGML_TYPE_F32 || t->ne[1] < 1) {
+            return true;
+        }
+        auto & row = so->lens_resid[il];
+        row.resize(t->ne[0]);
+        ggml_backend_tensor_get(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], t->ne[0] * sizeof(float));
+        return true;
+    }
+
+    // the output norm and matrix, once; throws if this architecture's head is not RMS norm + matrix
+    void lens_init() {
+        if (lens_out) {
+            return;
+        }
+        if (!model->output_norm || model->output_norm_b || model->output_s) {
+            throw std::runtime_error("layer readout: this model's output head is not an RMS norm and a matrix");
+        }
+        const ggml_tensor * out = model->output ? model->output : model->tok_embd;
+        if (!out) {
+            throw std::runtime_error("layer readout: the model has no output matrix");
+        }
+        tensor_row_to_float(model->output_norm, 0, lens_norm_w);
+        lens_out = out;
+    }
+
+    const std::vector<float> & lens_row(llama_token label) {
+        auto it = lens_rows.find(label);
+        if (it == lens_rows.end()) {
+            if (lens_rows.size() > 4096) {
+                lens_rows.clear();
+            }
+            it = lens_rows.emplace(label, std::vector<float>()).first;
+            tensor_row_to_float(lens_out, label, it->second);
+        }
+        return it->second;
+    }
+
+    // the label logits a layer's residual would give through the output head: RMS norm, then the matrix rows
+    std::vector<float> lens_scores(const std::vector<float> & resid, const std::vector<llama_token> & labels) {
+        const size_t n = resid.size();
+        if (n != lens_norm_w.size()) {
+            throw std::runtime_error("layer readout: residual width does not match the output norm");
+        }
+        double ss = 0.0;
+        for (const float v : resid) {
+            ss += (double) v * v;
+        }
+        const float scale = 1.0f / sqrtf((float) (ss / n) + model->hparams.f_norm_rms_eps);
+        std::vector<float> h(n);
+        for (size_t i = 0; i < n; i++) {
+            h[i] = resid[i] * scale * lens_norm_w[i];
+        }
+        std::vector<float> scores;
+        for (const llama_token label : labels) {
+            const auto & w = lens_row(label);
+            double dot = 0.0;
+            for (size_t i = 0; i < n; i++) {
+                dot += (double) h[i] * w[i];
+            }
+            scores.push_back((float) dot);
+        }
+        return scores;
+    }
+
+    static std::vector<float> pool_groups(std::vector<float> scores, const std::vector<int32_t> & groups) {
+        if (groups.empty()) {
+            return scores;
+        }
+        std::vector<float> pooled;
+        size_t i = 0;
+        for (const int32_t n : groups) {
+            if (n <= 0 || i + n > scores.size()) {
+                throw std::runtime_error("label groups do not match the labels");
+            }
+            pooled.push_back(*std::max_element(scores.begin() + i, scores.begin() + i + n));
+            i += n;
+        }
+        return pooled;
+    }
+
+    // what the model is made of, for an architecture view
+    json model_info() const {
+        const auto & hp = model->hparams;
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        char desc[256];
+        llama_model_desc(model, desc, sizeof(desc));
+        json info = json::object();
+        info["model"]            = model_name;
+        info["name"]             = model->name;
+        info["architecture"]     = model->arch_name();
+        info["description"]      = desc;
+        info["decision_type"]    = type_name;
+        info["n_params"]         = (int64_t) llama_model_n_params(model);
+        info["size_bytes"]       = (int64_t) llama_model_size(model);
+        info["n_layer"]          = (int32_t) hp.n_layer();
+        info["n_layer_decision"] = (int32_t) hp.n_layer_decision;
+        info["n_embd"]           = (int32_t) hp.n_embd;
+        info["n_head"]           = llama_model_n_head(model);
+        info["n_head_kv"]        = llama_model_n_head_kv(model);
+        info["n_vocab"]          = llama_vocab_n_tokens(vocab);
+        info["n_ctx_train"]      = llama_model_n_ctx_train(model);
+        info["n_ctx"]            = (int32_t) n_ctx;
+        const bool lfm = model->arch == LLM_ARCH_LFM2 || model->arch == LLM_ARCH_LFM3;
+        json layers = json::array();
+        for (uint32_t il = 0; il < hp.n_layer(); il++) {
+            json l = json::object();
+            l["i"] = (int32_t) il;
+            if (hp.is_recr(il)) {
+                l["kind"] = lfm ? "shortconv" : "recurrent";
+            } else {
+                l["kind"] = hp.is_swa(il) ? "attention_swa" : "attention";
+            }
+            l["decision_head"] = hp.n_layer_decision > 0 && il >= hp.n_layer() - hp.n_layer_decision;
+            layers.push_back(l);
+        }
+        info["layers"] = layers;
+        return info;
+    }
+
     ~systemone() {
         if (ctx)   llama_free(ctx);
         if (model) llama_model_free(model);
     }
 
     // The scores of one task: the prompt through the model in one batch, read as the server reads it.
-    std::vector<float> run(const server_task & task) {
+    // layers, if given, receives the label scores of every layer (empty rows for layers without a readout)
+    std::vector<float> run(const server_task & task, std::vector<std::vector<float>> * layers = nullptr) {
         const llama_tokens & tokens = task.tokens.tokens;
         const int32_t n_tokens = (int32_t) tokens.size();
         if (n_tokens == 0) {
@@ -120,9 +284,23 @@ struct systemone {
             }
         }
 
+        const bool lens = layers != nullptr && !d.labels.empty() && !d.pooled;
+        if (lens) {
+            lens_init();
+            lens_resid.assign(llama_model_n_layer(model), {});
+            lens_active = true;
+        }
         const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+        lens_active = false;
         if (rc != 0) {
             throw std::runtime_error(string_format("llama_process failed (%d)", rc));
+        }
+        if (lens) {
+            layers->clear();
+            for (const auto & resid : lens_resid) {
+                layers->push_back(resid.empty() ? std::vector<float>() : pool_groups(lens_scores(resid, d.labels), d.label_groups));
+            }
+            lens_resid.clear();
         }
 
         std::vector<float> scores;
@@ -234,6 +412,54 @@ struct systemone {
     }
 
 private:
+    // the answer of each layer in the shape of the final answer: a row of probabilities per option, or the
+    // noul probability; null for a layer without a readout
+    json layers_answer(const server_decision_question & question, size_t n_variants, size_t first_task,
+                       const std::vector<std::vector<std::vector<float>>> & layer_results, const std::string & error) const {
+        json out = json::object();
+        if (!error.empty()) {
+            out["error"] = error;
+            return out;
+        }
+        json options = json::array();
+        for (const auto & option : question.options) {
+            options.push_back(option.key);
+        }
+        out["options"] = options;
+        const size_t n_layer = layer_results[first_task].size();
+        json rows = json::array();
+        for (size_t il = 0; il < n_layer; il++) {
+            std::vector<std::vector<float>> scores;
+            bool complete = true;
+            for (size_t v = 0; v < n_variants; v++) {
+                const auto & per_layer = layer_results[first_task + v];
+                if (il >= per_layer.size() || per_layer[il].empty()) {
+                    complete = false;
+                    break;
+                }
+                scores.push_back(per_layer[il]);
+            }
+            if (!complete) {
+                rows.push_back(nullptr);
+                continue;
+            }
+            const json a = decision.format_answer(question, scores, false);
+            if (a.contains("noul")) {
+                rows.push_back(a.at("noul").get<double>());
+            } else if (a.contains("probabilities")) {
+                json row = json::array();
+                for (const auto & option : question.options) {
+                    row.push_back(a.at("probabilities").at(option.key).get<double>());
+                }
+                rows.push_back(row);
+            } else {
+                rows.push_back(nullptr);
+            }
+        }
+        out["probabilities"] = rows;
+        return out;
+    }
+
     // called with the mutex held
     std::string answer(const std::string & request) {
         if (decision.type == COMMON_DECISION_TYPE_NONE) {
@@ -268,10 +494,28 @@ private:
                 }
             }
 
+            // "layers": true (an extension of this library) adds the answer of every layer, a logit lens
+            const bool want_layers = json_value(body, "layers", false);
             std::vector<std::vector<float>> results;
+            std::vector<std::vector<std::vector<float>>> layer_results; // [task][layer][option]
             int32_t n_tokens = 0;
+            std::string layers_error;
             for (const auto & task : tasks) {
-                results.push_back(run(task));
+                std::vector<std::vector<float>> layers;
+                if (want_layers && !decision.is_joint() && !task.decision.labels.empty() && !task.decision.pooled) {
+                    try {
+                        results.push_back(run(task, &layers));
+                    } catch (const std::exception & e) {
+                        layers_error = e.what();
+                        results.push_back(run(task));
+                    }
+                } else {
+                    results.push_back(run(task));
+                    if (want_layers && layers_error.empty()) {
+                        layers_error = "layer readout is only available for models read from label tokens (d1, lev, pplx-decider, ...)";
+                    }
+                }
+                layer_results.push_back(std::move(layers));
                 n_tokens += task.n_tokens();
             }
 
@@ -292,7 +536,11 @@ private:
                         scores.push_back(results[i_result++]);
                     }
                 }
-                answers[question.id] = decision.format_answer(question, scores, false);
+                json answer = decision.format_answer(question, scores, false);
+                if (want_layers) {
+                    answer["layers"] = layers_answer(question, scores.size(), i_result - scores.size(), layer_results, layers_error);
+                }
+                answers[question.id] = answer;
             }
 
             json usage = json::object();
@@ -348,6 +596,8 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     cparams.n_batch   = so->n_ctx; // the whole prompt goes through in one batch
     cparams.n_ubatch  = so->n_ctx;
     cparams.n_seq_max = 1;
+    cparams.cb_eval           = systemone::cb_eval; // only reads when a request asks for layers
+    cparams.cb_eval_user_data = so.get();
     cparams.no_perf   = true;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     if (params.n_threads > 0) {
@@ -399,6 +649,20 @@ char * systemone_decide(systemone * so, const char * request_json) {
     char * s = (char *) malloc(n);
     if (s) {
         memcpy(s, src, n);
+    }
+    return s;
+}
+
+char * systemone_model_info(const systemone * so) {
+    std::string out;
+    try {
+        out = so ? so->model_info().dump_safe() : error_json("no model", "invalid_request_error");
+    } catch (...) {
+        out = "{\"error\":{\"message\":\"internal error\",\"type\":\"server_error\"}}";
+    }
+    char * s = (char *) malloc(out.size() + 1);
+    if (s) {
+        memcpy(s, out.c_str(), out.size() + 1);
     }
     return s;
 }

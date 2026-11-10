@@ -27,7 +27,7 @@ template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     if (body.contains(key) && !body.at(key).is_null()) {
         try {
-            return body.at(key);
+            return body.at(key).get<T>();
         } catch (...) {
             return default_value;
         }

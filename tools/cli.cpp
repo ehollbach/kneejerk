@@ -17,6 +17,7 @@ static void usage(const char * argv0) {
     fprintf(stderr,
             "usage: %s -m MODEL.gguf [-ngl N] [-c N_CTX] [-t THREADS] [--no-repack] [--time] [-v]\n"
             "  reads one JSON request per line from stdin, writes one JSON answer per line\n"
+            "  --info       print what the model is made of (JSON) and exit\n"
             "  --time       adds \"_wall_ms\" to every answer\n"
             "  --no-repack  no repacked copy of the weights: about half the RAM, slower on ARM\n",
             argv0);
@@ -25,6 +26,7 @@ static void usage(const char * argv0) {
 int main(int argc, char ** argv) {
     const char * model = nullptr;
     systemone_params params = systemone_default_params();
+    bool info = false;
     bool time = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -43,6 +45,8 @@ int main(int argc, char ** argv) {
             params.n_ctx = (uint32_t) atoi(next("-c"));
         } else if (a == "-t" || a == "--threads") {
             params.n_threads = atoi(next("-t"));
+        } else if (a == "--info") {
+            info = true;
         } else if (a == "--no-repack") {
             params.repack = false;
         } else if (a == "--time") {
@@ -68,6 +72,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "systemone-cli: %s loaded, decision model type %s\n", model, systemone_model_type(so));
+    if (info) {
+        char * text = systemone_model_info(so);
+        printf("%s\n", text ? text : "{}");
+        systemone_free_string(text);
+        systemone_free(so);
+        return 0;
+    }
 
     std::string line;
     while (std::getline(std::cin, line)) {
