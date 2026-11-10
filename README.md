@@ -143,6 +143,13 @@ runtime, and those kernels round differently. The decisions are the same either 
 decisions with answers): on 200 validation questions d1-2B Q4_K_M answers 119/200 through the
 library and 119/200 through the server, 200/200 the same answer, largest difference 0.0000.
 
+## PRs welcome
+
+Most useful, in order: a family tested against llama-server with `tests/parity.py` and its row in
+the table above; a layer readout for a family without one (the last block must reproduce the
+answer, `tests/layers.py`); phone numbers for `docs/phone.md`; the iOS side of the Capacitor
+plugin. Small, measured, no generation.
+
 ## How it is built
 
 `src/upstream/` is `tools/server/server-decision.{h,cpp}` from llama.cpp b12207, unchanged, so
