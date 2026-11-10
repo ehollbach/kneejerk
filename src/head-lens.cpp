@@ -120,7 +120,7 @@ bool lfm2_head_lens::init(const llama_model * model) {
     return true;
 }
 
-std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, const std::vector<int32_t> & positions, int32_t type, int n_threads, bool normed) {
+std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, const std::vector<int32_t> & positions, int32_t type, int n_threads, bool normed, ggml_threadpool * threadpool) {
     if (!ctx_w) {
         throw std::runtime_error("head lens: not initialised");
     }
@@ -182,7 +182,7 @@ std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, co
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
     ggml_build_forward_expand(gf, s);
-    ggml_cplan plan = ggml_graph_plan(gf, n_threads > 0 ? n_threads : 4, nullptr);
+    ggml_cplan plan = ggml_graph_plan(gf, n_threads > 0 ? n_threads : 4, threadpool);
     std::vector<uint8_t> work(plan.work_size + 64);
     plan.work_data = work.data();
     const ggml_status st = ggml_graph_compute(gf, &plan);

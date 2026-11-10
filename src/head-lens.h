@@ -27,7 +27,7 @@ struct lfm2_head_lens {
     // the head's scores at the given prompt positions for one question type, from the residual stream
     // after an encoder block: resid is [n_tokens * n_embd], as the layer wrote it (before the output norm),
     // or, with normed = true, the output norm's result itself (what the head receives)
-    std::vector<float> run(const float * resid, int32_t n_tokens, const std::vector<int32_t> & positions, int32_t type, int n_threads, bool normed = false);
+    std::vector<float> run(const float * resid, int32_t n_tokens, const std::vector<int32_t> & positions, int32_t type, int n_threads, bool normed = false, struct ggml_threadpool * threadpool = nullptr);
 
     // the question-type vector the head adds to its input
     std::vector<float> type_row(int32_t type) const;

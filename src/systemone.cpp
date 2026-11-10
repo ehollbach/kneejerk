@@ -105,6 +105,7 @@ struct systemone {
     std::unique_ptr<lfm2_head_lens> head_lens;                      // LFM2 d1: the decision head, re-run on every encoder block
     bool head_lens_tried = false;
     int n_threads = 4;
+    ggml_threadpool * threadpool = nullptr;                         // one pool for llama.cpp and the readouts: no thread spawn per graph piece
     std::chrono::steady_clock::time_point lens_t0;                  // when the forward pass started
     std::vector<double> lens_ms;                                    // [n_layer] when each layer's output was ready, ms after t0
     double lens_process_ms = 0, lens_readout_ms = 0;                // the forward pass, and the lens arithmetic after it
@@ -309,7 +310,7 @@ struct systemone {
         ggml_cgraph * gf = ggml_new_graph(ctx_l);
         ggml_build_forward_expand(gf, y);
         // the work buffer outside the context: its size depends on the threads and the kernels
-        ggml_cplan plan = ggml_graph_plan(gf, n_threads, nullptr);
+        ggml_cplan plan = ggml_graph_plan(gf, n_threads, threadpool);
         std::vector<uint8_t> work(plan.work_size + 64);
         plan.work_data = work.data();
         const ggml_status st = ggml_graph_compute(gf, &plan);
@@ -489,6 +490,7 @@ struct systemone {
     ~systemone() {
         if (ctx)   llama_free(ctx);
         if (model) llama_model_free(model);
+        if (threadpool) ggml_threadpool_free(threadpool);
     }
 
     // The scores of one task: the prompt through the model in one batch, read as the server reads it.
@@ -607,7 +609,7 @@ struct systemone {
                     // the head on this encoder block's full residual stream; the head's own blocks have no readout yet
                     const auto & full = il < lens_full.size() ? lens_full[il] : std::vector<float>();
                     if ((int) il < n_layer_enc && !full.empty() && full.size() == (size_t) n_tokens * llama_model_n_embd(model)) {
-                        layers->push_back(head_lens->run(full.data(), n_tokens, d.markers, d.column, n_threads, lens_full_normed[il]));
+                        layers->push_back(head_lens->run(full.data(), n_tokens, d.markers, d.column, n_threads, lens_full_normed[il], threadpool));
                     } else {
                         layers->push_back({});
                     }
@@ -1019,6 +1021,10 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     cparams.no_perf   = true;
     cparams.flash_attn_type = params.flash_attn ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     so->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    {
+        ggml_threadpool_params tpp = ggml_threadpool_params_default(so->n_threads);
+        so->threadpool = ggml_threadpool_new(&tpp);
+    }
     if (params.n_threads > 0) {
         cparams.n_threads       = params.n_threads;
         cparams.n_threads_batch = params.n_threads;
@@ -1027,6 +1033,9 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     if (!so->ctx) {
         fprintf(stderr, "systemone: failed to create the context\n");
         return nullptr;
+    }
+    if (so->threadpool) {
+        llama_attach_threadpool(so->ctx, so->threadpool, so->threadpool);
     }
 
     try {
