@@ -54,6 +54,42 @@ const char * decision_type_name(common_decision_type type) {
 
 void quiet_log(ggml_log_level, const char *, void *) {}
 
+// On a phone the cores differ (big.LITTLE). A forward pass read in pieces lets the worker threads sleep between
+// pieces, and Android wakes them on the small cores: three times slower. Pin the pool to the fastest cores,
+// by cpuinfo_max_freq; on a machine where every core is the same this does nothing.
+void pin_to_fast_cores(ggml_threadpool_params & tpp, int n_threads) {
+    std::vector<std::pair<long, int>> freq; // (max freq, cpu)
+    for (int cpu = 0; cpu < GGML_MAX_N_THREADS; cpu++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+        FILE * f = fopen(path, "r");
+        if (!f) {
+            break;
+        }
+        long v = 0;
+        if (fscanf(f, "%ld", &v) == 1) {
+            freq.emplace_back(v, cpu);
+        }
+        fclose(f);
+    }
+    if ((int) freq.size() < n_threads + 1) {
+        return;
+    }
+    const long lo = std::min_element(freq.begin(), freq.end())->first;
+    const long hi = std::max_element(freq.begin(), freq.end())->first;
+    if (hi <= lo * 11 / 10) {
+        return; // homogeneous: let the scheduler be
+    }
+    std::stable_sort(freq.begin(), freq.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    for (int i = 0; i < GGML_MAX_N_THREADS; i++) {
+        tpp.cpumask[i] = false;
+    }
+    for (int i = 0; i < n_threads && i < (int) freq.size(); i++) {
+        tpp.cpumask[freq[i].second] = true;
+    }
+    tpp.strict_cpu     = true;
+}
+
 // one row of a weight tensor as floats, whatever its type and wherever it lives
 void tensor_row_to_float(const ggml_tensor * t, int64_t row, std::vector<float> & out) {
     const int64_t n = t->ne[0];
@@ -1117,6 +1153,7 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     so->n_threads = params.n_threads > 0 ? params.n_threads : 4;
     {
         ggml_threadpool_params tpp = ggml_threadpool_params_default(so->n_threads);
+        pin_to_fast_cores(tpp, so->n_threads);
         so->threadpool = ggml_threadpool_new(&tpp);
     }
     if (params.n_threads > 0) {
