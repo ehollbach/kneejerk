@@ -100,6 +100,7 @@ struct systemone {
     const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
     std::chrono::steady_clock::time_point lens_t0;                  // when the forward pass started
     std::vector<double> lens_ms;                                    // [n_layer] when each layer's output was ready, ms after t0
+    double lens_process_ms = 0, lens_readout_ms = 0;                // the forward pass, and the lens arithmetic after it
 
     // ggml asks before each node whether its data is needed, then calls again once it is computed
     static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
@@ -312,18 +313,23 @@ struct systemone {
         }
         const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
         lens_active = false;
-        if (lens && layer_ms) {
-            *layer_ms = lens_ms;
+        if (lens) {
+            lens_process_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lens_t0).count();
+            if (layer_ms) {
+                *layer_ms = lens_ms;
+            }
         }
         if (rc != 0) {
             throw std::runtime_error(string_format("llama_process failed (%d)", rc));
         }
         if (lens) {
+            const auto t_readout = std::chrono::steady_clock::now();
             layers->clear();
             for (const auto & resid : lens_resid) {
                 layers->push_back(resid.empty() ? std::vector<float>() : pool_groups(lens_scores(resid, d.labels), d.label_groups));
             }
             lens_resid.clear();
+            lens_readout_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_readout).count();
         }
 
         std::vector<float> scores;
@@ -487,6 +493,10 @@ private:
             if (v < 0) ms.push_back(nullptr); else ms.push_back(v);
         }
         out["ms"] = ms;
+        json timings = json::object();
+        timings["forward_ms"] = lens_process_ms;
+        timings["readout_ms"] = lens_readout_ms;
+        out["timings"] = timings;
         return out;
     }
 
