@@ -11,6 +11,7 @@
 #include "server-decision.h"
 #include "llama-ext.h"
 #include "llama-model.h"   // the output norm and matrix, the layer kinds: for the layer readout and model info
+#include "head-lens.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
@@ -101,6 +102,9 @@ struct systemone {
     std::unordered_map<llama_token, std::vector<float>> lens_rows;  // rows of the output matrix, dequantized
     std::vector<float> lens_norm_w;                                 // the output norm weight
     const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
+    std::unique_ptr<lfm2_head_lens> head_lens;                      // LFM2 d1: the decision head, re-run on every encoder block
+    bool head_lens_tried = false;
+    int n_threads = 4;
     std::chrono::steady_clock::time_point lens_t0;                  // when the forward pass started
     std::vector<double> lens_ms;                                    // [n_layer] when each layer's output was ready, ms after t0
     double lens_process_ms = 0, lens_readout_ms = 0;                // the forward pass, and the lens arithmetic after it
@@ -410,11 +414,22 @@ struct systemone {
 
         // the layer readout: label logits at the last position, or one embedding column at each option's marker
         const bool lens_labels  = !d.labels.empty() && !d.pooled;
-        // a model with a trained decision head (LFM2 d1-omni, ModernBERT) answers through that head, not through the
-        // output norm: a column of the normalised residual is not its answer, so no curve for those yet
-        const bool lens_markers = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0 &&
-                                  model->hparams.n_layer_decision == 0;
-        const bool lens = layers != nullptr && (lens_labels || lens_markers);
+        // a model with a trained decision head (LFM2 d1-omni) answers through that head, not through the output norm:
+        // the readout re-runs the head on the residual after every encoder block (head-lens.cpp)
+        const bool marker_readout = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0;
+        const bool lens_markers = marker_readout && model->hparams.n_layer_decision == 0;
+        bool lens_head = false;
+        if (layers != nullptr && marker_readout && model->hparams.n_layer_decision > 0 && n_tokens <= LENS_MAX_TOKENS) {
+            if (!head_lens_tried) {
+                head_lens_tried = true;
+                auto h = std::make_unique<lfm2_head_lens>();
+                if (h->init(model)) {
+                    head_lens = std::move(h);
+                }
+            }
+            lens_head = head_lens != nullptr;
+        }
+        const bool lens = layers != nullptr && (lens_labels || lens_markers || lens_head);
         if (lens) {
             lens_init();
             lens_pos = lens_labels ? std::vector<int32_t>{n_tokens - 1} : d.markers;
@@ -429,7 +444,7 @@ struct systemone {
             }
             lens_resid.assign(llama_model_n_layer(model), {});
             lens_ms.assign(llama_model_n_layer(model), -1.0);
-            lens_tokens = per_token != nullptr && n_tokens <= LENS_MAX_TOKENS;
+            lens_tokens = (per_token != nullptr || lens_head) && n_tokens <= LENS_MAX_TOKENS;
             lens_full.assign(lens_tokens ? llama_model_n_layer(model) : 0, {});
             lens_inp.clear();
             lens_attn.clear();
@@ -450,8 +465,18 @@ struct systemone {
         if (lens) {
             const auto t_readout = std::chrono::steady_clock::now();
             layers->clear();
-            for (const auto & resid : lens_resid) {
-                if (resid.empty()) {
+            const int n_layer_enc = (int) llama_model_n_layer(model) - (int) model->hparams.n_layer_decision;
+            for (size_t il = 0; il < lens_resid.size(); il++) {
+                const auto & resid = lens_resid[il];
+                if (lens_head) {
+                    // the head on this encoder block's full residual stream; the head's own blocks have no readout yet
+                    const auto & full = il < lens_full.size() ? lens_full[il] : std::vector<float>();
+                    if ((int) il < n_layer_enc && !full.empty() && full.size() == (size_t) n_tokens * llama_model_n_embd(model)) {
+                        layers->push_back(head_lens->run(full.data(), n_tokens, d.markers, d.column, n_threads));
+                    } else {
+                        layers->push_back({});
+                    }
+                } else if (resid.empty()) {
                     layers->push_back({});
                 } else if (lens_labels) {
                     layers->push_back(pool_groups(lens_scores(resid, d.labels), d.label_groups));
@@ -722,12 +747,14 @@ private:
                 std::vector<double> ms;
                 lens_tokens_result per_token;
                 const auto & td = task.decision;
-                const bool head_model = model->hparams.n_layer_decision > 0 && td.labels.empty();
-                const bool lens_possible = !decision.is_joint() && !td.pooled && !head_model &&
+                const bool lens_possible = !decision.is_joint() && !td.pooled &&
                     (!td.labels.empty() || (!td.markers.empty() && td.pointer < 0 && td.n_scores == 0));
                 if (want_layers && lens_possible) {
                     try {
                         results.push_back(run(task, &layers, &ms, &per_token));
+                        if (layers.empty() && model->hparams.n_layer_decision > 0 && layers_error.empty()) {
+                            layers_error = "this model answers through a trained decision head this library cannot re-run yet";
+                        }
                     } catch (const std::exception & e) {
                         layers_error = e.what();
                         results.push_back(run(task));
@@ -735,9 +762,7 @@ private:
                 } else {
                     results.push_back(run(task));
                     if (want_layers && layers_error.empty()) {
-                        layers_error = model->hparams.n_layer_decision > 0
-                            ? "this model answers through its own trained decision head, not through the output layer; no layer curve yet"
-                            : "layer readout is not available for models read from a pooled embedding or a pointer (Laya, kev, ...)";
+                        layers_error = "layer readout is not available for models read from a pooled embedding or a pointer (Laya, kev, ...)";
                     }
                 }
                 layer_results.push_back(std::move(layers));
@@ -828,6 +853,7 @@ systemone * systemone_load(const char * model_path, const systemone_params * par
     cparams.cb_eval_user_data = so.get();
     cparams.no_perf   = true;
     cparams.flash_attn_type = params.flash_attn ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    so->n_threads = params.n_threads > 0 ? params.n_threads : 4;
     if (params.n_threads > 0) {
         cparams.n_threads       = params.n_threads;
         cparams.n_threads_batch = params.n_threads;
