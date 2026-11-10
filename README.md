@@ -143,6 +143,12 @@ runtime, and those kernels round differently. The decisions are the same either 
 decisions with answers): on 200 validation questions d1-2B Q4_K_M answers 119/200 through the
 library and 119/200 through the server, 200/200 the same answer, largest difference 0.0000.
 
+Verified readouts (the last block reproduces the answer, `tests/results_layers_2026-11-10.txt`):
+d1 2B and H2O Lightning through the output matrix, d1-omni 600M and Laya through their trained
+decision head re-run in ggml (`src/head-lens.cpp`). Next: the pointer readout (Kev), attention per
+option, and patching: the same callback can write a residual back, so "which block flips the
+answer" is one more pass per block.
+
 ## PRs welcome
 
 Most useful, in order: a family tested against llama-server with `tests/parity.py` and its row in
