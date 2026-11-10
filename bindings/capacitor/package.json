@@ -1,0 +1,54 @@
+{
+  "name": "capacitor-kneejerk",
+  "version": "0.1.0",
+  "description": "Decision models (TypeSafe /v1/systemone: d1, Laya, H2O Lightning, Clef...) inside a Capacitor app, natively, through kneejerk on llama.cpp",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "files": [
+    "dist/",
+    "android/src",
+    "android/build.gradle",
+    "android/proguard-rules.pro"
+  ],
+  "author": "Kateřina Fajmanová",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moudrkat/kneejerk.git",
+    "directory": "bindings/capacitor"
+  },
+  "keywords": [
+    "capacitor",
+    "plugin",
+    "native",
+    "decision-model",
+    "systemone",
+    "jev",
+    "llama.cpp",
+    "on-device"
+  ],
+  "scripts": {
+    "build": "npm run clean && tsc && rollup -c rollup.config.mjs",
+    "clean": "rimraf ./dist",
+    "watch": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.0.0",
+    "@capacitor/core": "^8.0.0",
+    "@capacitor/ios": "^8.0.0",
+    "rimraf": "^6.1.0",
+    "rollup": "^4.53.2",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=8.0.0"
+  },
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  }
+}

@@ -5,3 +5,9 @@ __pycache__/
 .cache/
 compile_commands.json
 notes/
+build*.log
+bindings/capacitor/node_modules/
+bindings/capacitor/dist/
+bindings/capacitor/android/build/
+bindings/capacitor/android/.gradle/
+bindings/capacitor/android/.cxx/
