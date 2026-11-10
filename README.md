@@ -79,10 +79,12 @@ Two things llama-server does not do, because an app that holds the model can:
 - `"layers": true` in the request adds to every answer the answer each layer would give: the
   residual stream after the layer, through the model's own output norm and output matrix,
   restricted to the label tokens, then the same softmax as the final answer. A logit lens, from
-  the same forward pass. `{"options": [...], "probabilities":
-  [[per option] per layer]}`, or `[noul per layer]`. Models that read their answer from label
-  tokens only (d1, lev, pplx-decider, ...); pooled-embedding models (Laya, kev) get an error
-  field instead. `tests/layers.py` prints the table, and how far the last layer is from the answer.
+  the same forward pass. Models read from an embedding column at each option (d1-omni) get the
+  same curve through the output norm. `{"options": [...], "probabilities":
+  [[per option] per layer]}`, or `[noul per layer]`, with `"ms"` (when each layer was done),
+  `"tokens"`, `"token_change"` (how much each layer moved each token) and, with `flash_attn`
+  off, `"attention"` (every head of the last position). Pooled-embedding models (Laya, kev) get
+  an error field instead. `tests/layers.py` prints the table, and how far the last layer is from the answer.
 - `systemone_model_info()` (CLI: `--info`) says what the model is made of: architecture,
   sizes, and every block with its kind (short convolution, attention, sliding-window attention)
   and whether it belongs to the decision head, from the GGUF.

@@ -94,7 +94,9 @@ struct systemone {
     // Layer readout (a logit lens): the residual stream at the last prompt position after each layer,
     // read through the model's own output norm and output matrix, restricted to the label tokens.
     bool lens_active = false;
-    std::vector<std::vector<float>> lens_resid;                     // [n_layer][n_embd], empty if the layer was not seen
+    std::vector<std::vector<float>> lens_resid;                     // [n_layer][n_pos * n_embd], empty if the layer was not seen
+    std::vector<int32_t> lens_pos;                                  // the prompt positions read (the last one, or the option markers)
+    int32_t lens_last_base = 0;                                     // the last layer only has the output rows: row = pos - base
     std::unordered_map<llama_token, std::vector<float>> lens_rows;  // rows of the output matrix, dequantized
     std::vector<float> lens_norm_w;                                 // the output norm weight
     const ggml_tensor * lens_out = nullptr;                         // the output matrix (or the tied embedding)
@@ -151,9 +153,22 @@ struct systemone {
         if (il < 0 || il >= (int) so->lens_resid.size() || t->ne[1] < 1) {
             return true;
         }
-        auto & row = so->lens_resid[il];
-        row.resize(t->ne[0]);
-        ggml_backend_tensor_get(t, row.data(), (size_t) (t->ne[1] - 1) * t->nb[1], t->ne[0] * sizeof(float));
+        const bool last = il == (int) so->lens_resid.size() - 1;
+        const int64_t n_embd = t->ne[0];
+        auto & rows = so->lens_resid[il];
+        rows.assign(so->lens_pos.size() * n_embd, 0.0f);
+        bool ok = true;
+        for (size_t k = 0; k < so->lens_pos.size(); k++) {
+            const int64_t row = last ? so->lens_pos[k] - so->lens_last_base : so->lens_pos[k];
+            if (row < 0 || row >= t->ne[1]) {
+                ok = false;
+                break;
+            }
+            ggml_backend_tensor_get(t, rows.data() + k * n_embd, (size_t) row * t->nb[1], n_embd * sizeof(float));
+        }
+        if (!ok) {
+            rows.clear();
+        }
         so->lens_ms[il] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - so->lens_t0).count();
         if (so->lens_tokens && il < (int) so->lens_full.size()) {
             auto & full = so->lens_full[il];
@@ -171,15 +186,14 @@ struct systemone {
         if (!model->output_norm || model->output_norm_b || model->output_s) {
             throw std::runtime_error("layer readout: this model's output head is not an RMS norm and a matrix");
         }
-        const ggml_tensor * out = model->output ? model->output : model->tok_embd;
-        if (!out) {
-            throw std::runtime_error("layer readout: the model has no output matrix");
-        }
         tensor_row_to_float(model->output_norm, 0, lens_norm_w);
-        lens_out = out;
+        lens_out = model->output ? model->output : model->tok_embd; // may be null for a model read from embeddings
     }
 
     const std::vector<float> & lens_row(llama_token label) {
+        if (!lens_out) {
+            throw std::runtime_error("layer readout: the model has no output matrix");
+        }
         auto it = lens_rows.find(label);
         if (it == lens_rows.end()) {
             if (lens_rows.size() > 4096) {
@@ -191,21 +205,27 @@ struct systemone {
         return it->second;
     }
 
-    // the label logits a layer's residual would give through the output head: RMS norm, then the matrix rows
-    std::vector<float> lens_scores(const std::vector<float> & resid, const std::vector<llama_token> & labels) {
-        const size_t n = resid.size();
+    // the output norm of the model applied to one residual row: what the head reads
+    std::vector<float> lens_norm(const float * resid, size_t n) const {
         if (n != lens_norm_w.size()) {
             throw std::runtime_error("layer readout: residual width does not match the output norm");
         }
         double ss = 0.0;
-        for (const float v : resid) {
-            ss += (double) v * v;
+        for (size_t i = 0; i < n; i++) {
+            ss += (double) resid[i] * resid[i];
         }
         const float scale = 1.0f / sqrtf((float) (ss / n) + model->hparams.f_norm_rms_eps);
         std::vector<float> h(n);
         for (size_t i = 0; i < n; i++) {
             h[i] = resid[i] * scale * lens_norm_w[i];
         }
+        return h;
+    }
+
+    // the label logits a layer's residual would give through the output head: RMS norm, then the matrix rows
+    std::vector<float> lens_scores(const std::vector<float> & resid, const std::vector<llama_token> & labels) {
+        const size_t n = resid.size();
+        const std::vector<float> h = lens_norm(resid.data(), n);
         std::vector<float> scores;
         for (const llama_token label : labels) {
             const auto & w = lens_row(label);
@@ -386,9 +406,21 @@ struct systemone {
             }
         }
 
-        const bool lens = layers != nullptr && !d.labels.empty() && !d.pooled;
+        // the layer readout: label logits at the last position, or one embedding column at each option's marker
+        const bool lens_labels  = !d.labels.empty() && !d.pooled;
+        const bool lens_markers = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0;
+        const bool lens = layers != nullptr && (lens_labels || lens_markers);
         if (lens) {
             lens_init();
+            lens_pos = lens_labels ? std::vector<int32_t>{n_tokens - 1} : d.markers;
+            lens_last_base = n_tokens - 1;
+            for (int32_t i = 0; i < n_tokens; i++) { // the first position with an output: row 0 of the last layer
+                if ((!d.labels.empty() && i == n_tokens - 1) ||
+                    (wants_embd && (d.pooled || (pos_first >= 0 && i >= pos_first) || (d.n_scores > 0 && i < d.n_scores)))) {
+                    lens_last_base = i;
+                    break;
+                }
+            }
             lens_resid.assign(llama_model_n_layer(model), {});
             lens_ms.assign(llama_model_n_layer(model), -1.0);
             lens_tokens = per_token != nullptr && n_tokens <= LENS_MAX_TOKENS;
@@ -413,7 +445,23 @@ struct systemone {
             const auto t_readout = std::chrono::steady_clock::now();
             layers->clear();
             for (const auto & resid : lens_resid) {
-                layers->push_back(resid.empty() ? std::vector<float>() : pool_groups(lens_scores(resid, d.labels), d.label_groups));
+                if (resid.empty()) {
+                    layers->push_back({});
+                } else if (lens_labels) {
+                    layers->push_back(pool_groups(lens_scores(resid, d.labels), d.label_groups));
+                } else {
+                    // markers: the embedding column of each option, as send_decision() reads it from the final embeddings
+                    const size_t n_embd = resid.size() / lens_pos.size();
+                    std::vector<float> scores;
+                    for (size_t k = 0; k < lens_pos.size(); k++) {
+                        const std::vector<float> h = lens_norm(resid.data() + k * n_embd, n_embd);
+                        if (d.column < 0 || (size_t) d.column >= h.size()) {
+                            throw std::runtime_error("embedding column out of range");
+                        }
+                        scores.push_back(h[d.column]);
+                    }
+                    layers->push_back(std::move(scores));
+                }
             }
             lens_resid.clear();
             if (lens_tokens && per_token) {
@@ -667,7 +715,10 @@ private:
                 std::vector<std::vector<float>> layers;
                 std::vector<double> ms;
                 lens_tokens_result per_token;
-                if (want_layers && !decision.is_joint() && !task.decision.labels.empty() && !task.decision.pooled) {
+                const auto & td = task.decision;
+                const bool lens_possible = !decision.is_joint() && !td.pooled &&
+                    (!td.labels.empty() || (!td.markers.empty() && td.pointer < 0 && td.n_scores == 0));
+                if (want_layers && lens_possible) {
                     try {
                         results.push_back(run(task, &layers, &ms, &per_token));
                     } catch (const std::exception & e) {
@@ -677,7 +728,7 @@ private:
                 } else {
                     results.push_back(run(task));
                     if (want_layers && layers_error.empty()) {
-                        layers_error = "layer readout is only available for models read from label tokens (d1, lev, pplx-decider, ...)";
+                        layers_error = "layer readout is not available for models read from a pooled embedding or a pointer (Laya, kev, ...)";
                     }
                 }
                 layer_results.push_back(std::move(layers));
