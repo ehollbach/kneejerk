@@ -76,18 +76,16 @@ Dart and Rust bindings are thin. The Capacitor plugin is `bindings/capacitor`
 
 Two things llama-server does not do, because an app that holds the model can:
 
-- `"layers": true` in the request adds to every answer the answer each layer would give: the
-  residual stream after the layer, through the model's own output norm and output matrix,
-  restricted to the label tokens, then the same softmax as the final answer. A logit lens, from
-  the same forward pass. Models read from an embedding column at each option (d1-omni) get the
-  same curve through the output norm. `{"options": [...], "probabilities":
-  [[per option] per layer]}`, or `[noul per layer]`, with `"ms"` (when each layer was done),
-  `"tokens"`, `"token_change"` (how much each layer moved each token) and, with `flash_attn`
-  off, `"attention"` (every head of the last position). Pooled-embedding models (Laya, kev) get
-  an error field instead. `tests/layers.py` prints the table, and how far the last layer is from the answer.
-- `systemone_model_info()` (CLI: `--info`) says what the model is made of: architecture,
-  sizes, and every block with its kind (short convolution, attention, sliding-window attention)
-  and whether it belongs to the decision head, from the GGUF.
+- `"layers": true` in the request adds to every answer what each block would answer: the residual
+  after the block, read the way the model reads its final answer (the output matrix on the label
+  tokens, or the model's trained decision head re-run in ggml, `src/head-lens.cpp`). Same forward
+  pass. With it come `ms` per block, `tokens`, `token_change` (how much each block moved each
+  token) and, with `flash_attn` off, `attention` (every head of the last position).
+- `systemone_model_info()` (CLI `--info`): architecture, sizes, every block with its kind and
+  whether it belongs to the decision head, from the GGUF.
+
+Verified (the last block reproduces the answer, `tests/results_layers_2026-11-10.txt`): d1 2B,
+H2O Lightning, d1-omni 600M, Laya. Next: Kev (pointer readout), attention per option, patching.
 
 ## Which models
 
@@ -142,12 +140,6 @@ runtime, and those kernels round differently. The decisions are the same either 
 `tests/accuracy.py` runs both on `tasksource/tasksource-jev-typed-decisions` (a million typed
 decisions with answers): on 200 validation questions d1-2B Q4_K_M answers 119/200 through the
 library and 119/200 through the server, 200/200 the same answer, largest difference 0.0000.
-
-Verified readouts (the last block reproduces the answer, `tests/results_layers_2026-11-10.txt`):
-d1 2B and H2O Lightning through the output matrix, d1-omni 600M and Laya through their trained
-decision head re-run in ggml (`src/head-lens.cpp`). Next: the pointer readout (Kev), attention per
-option, and patching: the same callback can write a residual back, so "which block flips the
-answer" is one more pass per block.
 
 ## PRs welcome
 
