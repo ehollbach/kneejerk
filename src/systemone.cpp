@@ -112,7 +112,11 @@ struct systemone {
     // and the attention of the last position (only without flash attention, where the softmax exists as a tensor)
     static constexpr int32_t LENS_MAX_TOKENS = 512;
     bool lens_tokens = false;
+    bool lens_bert = false;                                         // ModernBERT: no l_out, the block outputs are derived
+    std::vector<float> lens_kqv;                                    // ModernBERT: kqv_out of the layer being computed
+    std::vector<float> dbg_head_in;                                 // debug: the head's own input, derived from its first block
     std::vector<std::vector<float>> lens_full;                      // [n_layer][n_tokens * n_embd]
+    std::vector<bool> lens_full_normed;                             // [n_layer] true if the row holds the output norm's result
     std::vector<float> lens_inp;                                    // [n_tokens * n_embd]
     std::unordered_map<int, std::vector<std::vector<float>>> lens_attn; // [il] -> [head][n_kv], the last query row of every head
 
@@ -123,6 +127,9 @@ struct systemone {
             return !ask;
         }
         const char * name = ggml_get_name(t);
+        if (so->lens_bert) {
+            return so->cb_eval_bert(t, ask, name);
+        }
         const bool is_l_out = strncmp(name, "l_out-", 6) == 0;
         const bool is_inp   = so->lens_tokens && strcmp(name, "inp_embd") == 0;
         const bool is_attn  = so->lens_tokens && strncmp(name, "kq_soft_max-", 12) == 0;
@@ -184,13 +191,92 @@ struct systemone {
         return true;
     }
 
+    // ModernBERT names no block output. The residual after block il is ffn_inp(il+1) - kqv_out(il+1); the last
+    // encoder block's is only seen after the output norm, as final_norm_out, which the head takes as it is.
+    bool cb_eval_bert(ggml_tensor * t, bool ask, const char * name) {
+        const bool is_kqv  = strncmp(name, "kqv_out-", 8) == 0;
+        const bool is_ffn  = strncmp(name, "ffn_inp-", 8) == 0;
+        const bool is_fin  = strcmp(name, "final_norm_out") == 0;
+        const bool is_inp  = strcmp(name, "inp_norm-0") == 0;
+        const bool is_attn = strncmp(name, "kq_soft_max-", 12) == 0;
+        if (!is_kqv && !is_ffn && !is_fin && !is_inp && !is_attn) {
+            return !ask;
+        }
+        if (ask) {
+            return true;
+        }
+        if (t->type != GGML_TYPE_F32) {
+            return true;
+        }
+        const int n_enc = (int) lens_full.size() - (int) model->hparams.n_layer_decision; // the head's blocks derive nothing
+        const size_t n = (size_t) t->ne[0] * t->ne[1];
+        if (is_inp) {
+            lens_inp.resize(n);
+            ggml_backend_tensor_get(t, lens_inp.data(), 0, n * sizeof(float));
+            return true;
+        }
+        if (is_attn) {
+            const int il = atoi(name + 12);
+            const int64_t n_kv = t->ne[0], n_q = t->ne[1], n_head = t->ne[2];
+            if (n_q < 1 || n_head < 1) return true;
+            std::vector<std::vector<float>> heads(n_head, std::vector<float>(n_kv));
+            for (int64_t h = 0; h < n_head; h++) {
+                ggml_backend_tensor_get(t, heads[h].data(), (size_t) (n_q - 1) * t->nb[1] + (size_t) h * t->nb[2], n_kv * sizeof(float));
+            }
+            lens_attn[il] = std::move(heads);
+            return true;
+        }
+        if (is_fin) {
+            if (n_enc > 0 && (int64_t) lens_n_tokens == t->ne[1]) {
+                auto & out = lens_full[n_enc - 1];
+                out.resize(n);
+                ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+                lens_full_normed[n_enc - 1] = true;
+                lens_ms[n_enc - 1] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lens_t0).count();
+            }
+            return true;
+        }
+        const int il = atoi(name + 8);
+        if (il == n_enc && (int64_t) lens_n_tokens == t->ne[1] && getenv("SYSTEMONE_DUMP") != nullptr) {
+            // debug: the first head block's input = final_norm_out + type_row(0); derive it once
+            if (is_kqv) {
+                lens_kqv.resize(n);
+                ggml_backend_tensor_get(t, lens_kqv.data(), 0, n * sizeof(float));
+            } else if (dbg_head_in.empty() && lens_kqv.size() == n) {
+                dbg_head_in.resize(n);
+                ggml_backend_tensor_get(t, dbg_head_in.data(), 0, n * sizeof(float));
+                for (size_t i = 0; i < n; i++) dbg_head_in[i] -= lens_kqv[i];
+            }
+            return true;
+        }
+        if (il < 1 || il >= n_enc || (int64_t) lens_n_tokens != t->ne[1]) {
+            return true; // layer 0 has no predecessor to derive; reduced layers are the head's
+        }
+        if (is_kqv) {
+            lens_kqv.resize(n);
+            ggml_backend_tensor_get(t, lens_kqv.data(), 0, n * sizeof(float));
+            return true;
+        }
+        if (lens_kqv.size() != n) {
+            return true;
+        }
+        auto & out = lens_full[il - 1];
+        out.resize(n);
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+        for (size_t i = 0; i < n; i++) {
+            out[i] -= lens_kqv[i];
+        }
+        lens_ms[il - 1] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lens_t0).count();
+        return true;
+    }
+
     // the output norm and matrix, once; throws if this architecture's head is not RMS norm + matrix
     void lens_init() {
         if (lens_out) {
             return;
         }
         if (!model->output_norm || model->output_norm_b || model->output_s) {
-            throw std::runtime_error("layer readout: this model's output head is not an RMS norm and a matrix");
+            throw std::runtime_error("layer readout: this model's output head is not a norm and a matrix");
         }
         tensor_row_to_float(model->output_norm, 0, lens_norm_w);
         lens_out = model->output ? model->output : model->tok_embd; // may be null for a model read from embeddings
@@ -419,6 +505,7 @@ struct systemone {
         const bool marker_readout = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0;
         const bool lens_markers = marker_readout && model->hparams.n_layer_decision == 0;
         bool lens_head = false;
+        const bool bert = model->arch == LLM_ARCH_MODERN_BERT;
         if (layers != nullptr && marker_readout && model->hparams.n_layer_decision > 0 && n_tokens <= LENS_MAX_TOKENS) {
             if (!head_lens_tried) {
                 head_lens_tried = true;
@@ -445,7 +532,10 @@ struct systemone {
             lens_resid.assign(llama_model_n_layer(model), {});
             lens_ms.assign(llama_model_n_layer(model), -1.0);
             lens_tokens = (per_token != nullptr || lens_head) && n_tokens <= LENS_MAX_TOKENS;
+            lens_bert = bert && lens_tokens;
             lens_full.assign(lens_tokens ? llama_model_n_layer(model) : 0, {});
+            lens_full_normed.assign(lens_full.size(), false);
+            lens_kqv.clear();
             lens_inp.clear();
             lens_attn.clear();
             lens_t0 = std::chrono::steady_clock::now();
@@ -453,6 +543,8 @@ struct systemone {
         }
         const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
         lens_active = false;
+        lens_bert = false;
+        lens_kqv.clear();
         if (lens) {
             lens_process_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lens_t0).count();
             if (layer_ms) {
@@ -472,7 +564,7 @@ struct systemone {
                     // the head on this encoder block's full residual stream; the head's own blocks have no readout yet
                     const auto & full = il < lens_full.size() ? lens_full[il] : std::vector<float>();
                     if ((int) il < n_layer_enc && !full.empty() && full.size() == (size_t) n_tokens * llama_model_n_embd(model)) {
-                        layers->push_back(head_lens->run(full.data(), n_tokens, d.markers, d.column, n_threads));
+                        layers->push_back(head_lens->run(full.data(), n_tokens, d.markers, d.column, n_threads, lens_full_normed[il]));
                     } else {
                         layers->push_back({});
                     }
@@ -497,6 +589,28 @@ struct systemone {
             lens_resid.clear();
             if (lens_tokens && per_token) {
                 *per_token = lens_token_readout(tokens);
+            }
+            if (getenv("SYSTEMONE_DUMP") != nullptr && !dbg_head_in.empty() && lens_head) {
+                const int n_enc_dbg = (int) llama_model_n_layer(model) - (int) model->hparams.n_layer_decision;
+                const auto & fin = lens_full[n_enc_dbg - 1];
+                const auto tr = head_lens->type_row(0);
+                const size_t ne = tr.size();
+                double max_d = 0, max_v = 0;
+                for (size_t i = 0; i < fin.size() && i < dbg_head_in.size(); i++) {
+                    const double expect = dbg_head_in[i] - tr[i % ne];
+                    max_d = std::max(max_d, fabs(expect - fin[i]));
+                    max_v = std::max(max_v, fabs(expect));
+                }
+                fprintf(stderr, "--- head input check: captured final_norm_out vs derived, max diff %.5f (max value %.3f), n %zu vs %zu\n", max_d, max_v, fin.size(), dbg_head_in.size());
+                dbg_head_in.clear();
+            }
+            if (getenv("SYSTEMONE_DUMP") != nullptr) {
+                for (size_t il = 0; il < layers->size(); il++) {
+                    if ((*layers)[il].empty()) continue;
+                    fprintf(stderr, "--- lens %zu:", il);
+                    for (const float v : (*layers)[il]) fprintf(stderr, " %.5f", v);
+                    fprintf(stderr, "\n");
+                }
             }
             lens_full.clear();
             lens_inp.clear();
@@ -577,6 +691,9 @@ struct systemone {
         if (d.column < 0 || d.column >= n_embd_out) {
             throw std::runtime_error("embedding column out of range");
         }
+        if (dump) {
+            fprintf(stderr, "--- marker readout: column %d, n_embd_out %d, pointer %d\n", d.column, n_embd_out, d.pointer);
+        }
         for (const int32_t marker : d.markers) {
             const float * embd = get_embd(marker);
             if (!embd || (d.pointer >= 0 && !embd_q)) {
@@ -591,6 +708,11 @@ struct systemone {
                 dot += embd_q[i] * embd[n_pointer + i];
             }
             scores.push_back(dot / sqrtf((float) n_pointer));
+        }
+        if (dump) {
+            fprintf(stderr, "--- raw scores:");
+            for (const float v : scores) fprintf(stderr, " %.5f", v);
+            fprintf(stderr, "\n");
         }
         return scores;
     }

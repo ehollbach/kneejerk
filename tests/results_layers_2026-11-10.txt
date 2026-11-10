@@ -41,4 +41,14 @@ tests/layers.py on aorus, 10 November 2026, kneejerk 86d4dc5 + head lens, llama.
          fraud 0.40 0.30 0.48 0.50 0.41 0.36 0.38 0.48 0.37 0.29 0.58 0.34 0.15 0.12 0.25 0.24 0.21 0.14 0.27 0.25 0.28 0.16 0.00 0.02
     last layer vs final: 0.0005
 
-== Laya-Q8_0: no readout yet (pointer readout through a decision head)
+== Laya-Q8_0: see below
+
+== Laya-Q8_0 (modern-bert, 28 encoder blocks + 2 decision-head blocks; the head re-run on every encoder block), later the same day
+The captured head input (final_norm_out) against the one derived from the head's first block: max diff 0.00000.
+111 tokens, 471 ms with layers
+  act (choice) final reply 0.273 weather 0.527 clarify 0.200 · last layer vs final: 0.0005
+  wants_info (noul) final 0.339 · last layer vs final: 0.0005
+100 tokens, 356 ms
+  refund (noul) final 0.789 · last layer vs final: 0.0001
+  team (choice) final billing 0.959 technical 0.020 fraud 0.021 · last layer vs final: 0.0000
+  (the curves ramp smoothly from block 15 on; raw scores on the last block 4.496/-2.345/-2.247 vs the model's 4.494/-2.345/-2.248)

@@ -54,9 +54,11 @@ ggml_tensor * lfm2_head_lens::copy(const ggml_tensor * src, ggml_type type) {
 
 bool lfm2_head_lens::init(const llama_model * model) {
     const auto & hp = model->hparams;
-    if (model->arch != LLM_ARCH_LFM2 || hp.n_layer_decision == 0 || !model->type_embd || !model->cls || !model->cls_out) {
+    if ((model->arch != LLM_ARCH_LFM2 && model->arch != LLM_ARCH_MODERN_BERT) || hp.n_layer_decision == 0 ||
+        !model->type_embd || !model->cls || !model->cls_out) {
         return false;
     }
+    rms_input = model->arch == LLM_ARCH_LFM2;
     const int n_layer     = (int) hp.n_layer();
     const int n_layer_enc = n_layer - (int) hp.n_layer_decision;
     n_embd      = hp.n_embd;
@@ -117,7 +119,7 @@ bool lfm2_head_lens::init(const llama_model * model) {
     return true;
 }
 
-std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, const std::vector<int32_t> & positions, int32_t type, int n_threads) {
+std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, const std::vector<int32_t> & positions, int32_t type, int n_threads, bool normed) {
     if (!ctx_w) {
         throw std::runtime_error("head lens: not initialised");
     }
@@ -143,7 +145,7 @@ std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, co
     memcpy(x->data, resid, (size_t) T * n_embd * sizeof(float));
 
     // the backbone's output norm, then the question type: what the head receives
-    ggml_tensor * h = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps_rms), output_norm);
+    ggml_tensor * h = normed ? x : ggml_mul(ctx, rms_input ? ggml_rms_norm(ctx, x, eps_rms) : ggml_norm(ctx, x, eps_ln), output_norm);
     ggml_tensor * type_row = ggml_view_1d(ctx, type_embd, n_embd, (size_t) type * type_embd->nb[1]);
     h = ggml_add(ctx, h, type_row);
 
@@ -195,4 +197,12 @@ std::vector<float> lfm2_head_lens::run(const float * resid, int32_t n_tokens, co
     }
     ggml_free(ctx);
     return scores;
+}
+
+std::vector<float> lfm2_head_lens::type_row(int32_t type) const {
+    std::vector<float> row(n_embd, 0.0f);
+    if (type_embd && type >= 0 && type < n_types) {
+        memcpy(row.data(), (const char *) type_embd->data + (size_t) type * type_embd->nb[1], n_embd * sizeof(float));
+    }
+    return row;
 }
