@@ -410,7 +410,10 @@ struct systemone {
 
         // the layer readout: label logits at the last position, or one embedding column at each option's marker
         const bool lens_labels  = !d.labels.empty() && !d.pooled;
-        const bool lens_markers = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0;
+        // a model with a trained decision head (LFM2 d1-omni, ModernBERT) answers through that head, not through the
+        // output norm: a column of the normalised residual is not its answer, so no curve for those yet
+        const bool lens_markers = d.labels.empty() && !d.markers.empty() && d.pointer < 0 && !d.pooled && d.n_scores == 0 &&
+                                  model->hparams.n_layer_decision == 0;
         const bool lens = layers != nullptr && (lens_labels || lens_markers);
         if (lens) {
             lens_init();
@@ -719,7 +722,8 @@ private:
                 std::vector<double> ms;
                 lens_tokens_result per_token;
                 const auto & td = task.decision;
-                const bool lens_possible = !decision.is_joint() && !td.pooled &&
+                const bool head_model = model->hparams.n_layer_decision > 0 && td.labels.empty();
+                const bool lens_possible = !decision.is_joint() && !td.pooled && !head_model &&
                     (!td.labels.empty() || (!td.markers.empty() && td.pointer < 0 && td.n_scores == 0));
                 if (want_layers && lens_possible) {
                     try {
@@ -731,7 +735,9 @@ private:
                 } else {
                     results.push_back(run(task));
                     if (want_layers && layers_error.empty()) {
-                        layers_error = "layer readout is not available for models read from a pooled embedding or a pointer (Laya, kev, ...)";
+                        layers_error = model->hparams.n_layer_decision > 0
+                            ? "this model answers through its own trained decision head, not through the output layer; no layer curve yet"
+                            : "layer readout is not available for models read from a pooled embedding or a pointer (Laya, kev, ...)";
                     }
                 }
                 layer_results.push_back(std::move(layers));
