@@ -150,6 +150,11 @@ the table above; a layer readout for a family without one (the last block must r
 answer, `tests/layers.py`); phone numbers for `docs/phone.md`; the iOS side of the Capacitor
 plugin. Small, measured, no generation.
 
+**Add a family**: it has to load in llama-server as a decision model first. Then `tests/parity.py`
+against that server, the row in the table, and if its answer is read in a new way, the readout in
+`src/systemone.cpp` (or `src/head-lens.cpp` for a trained head) with `tests/layers.py` showing the
+last block reproduces the answer. Numbers in the PR, not adjectives.
+
 ## How it is built
 
 `src/upstream/` is `tools/server/server-decision.{h,cpp}` from llama.cpp b12207, unchanged, so
