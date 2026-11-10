@@ -282,21 +282,30 @@ struct systemone {
         lens_out = model->output ? model->output : model->tok_embd; // may be null for a model read from embeddings
     }
 
-    // all logits of one normalised residual through the output matrix: a ggml mul_mat, which works whether or not
-    // llama.cpp repacked the matrix for its fast kernels (reading its rows would not)
-    std::vector<float> lens_logits(const std::vector<float> & h) {
+    // the logits of many normalised residuals (one per layer) through the output matrix in one ggml mul_mat, which
+    // works whether or not llama.cpp repacked the matrix for its fast kernels (reading its rows would not).
+    // Returns [n_rows][n_vocab].
+    std::vector<std::vector<float>> lens_logits(const std::vector<std::vector<float>> & hs) {
         if (!lens_out) {
             throw std::runtime_error("layer readout: the model has no output matrix");
         }
         const int64_t n_vocab = lens_out->ne[1];
-        ggml_init_params ip = { (size_t) (h.size() + n_vocab) * sizeof(float) + 4 * 1024 * 1024, nullptr, false };
+        const int64_t n_embd  = lens_out->ne[0];
+        const int64_t n_rows  = (int64_t) hs.size();
+        ggml_init_params ip = { (size_t) n_rows * (n_embd + n_vocab) * sizeof(float) + 4 * 1024 * 1024, nullptr, false };
         ggml_context * ctx_l = ggml_init(ip);
         if (!ctx_l) {
             throw std::runtime_error("layer readout: out of memory");
         }
-        ggml_tensor * x = ggml_new_tensor_1d(ctx_l, GGML_TYPE_F32, h.size());
-        memcpy(x->data, h.data(), h.size() * sizeof(float));
-        ggml_tensor * y = ggml_mul_mat(ctx_l, const_cast<ggml_tensor *>(lens_out), x);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx_l, GGML_TYPE_F32, n_embd, n_rows);
+        for (int64_t r = 0; r < n_rows; r++) {
+            if ((int64_t) hs[r].size() != n_embd) {
+                ggml_free(ctx_l);
+                throw std::runtime_error("layer readout: residual width does not match the output matrix");
+            }
+            memcpy((float *) x->data + r * n_embd, hs[r].data(), n_embd * sizeof(float));
+        }
+        ggml_tensor * y = ggml_mul_mat(ctx_l, const_cast<ggml_tensor *>(lens_out), x); // [n_vocab, n_rows]
         ggml_cgraph * gf = ggml_new_graph(ctx_l);
         ggml_build_forward_expand(gf, y);
         // the work buffer outside the context: its size depends on the threads and the kernels
@@ -308,7 +317,11 @@ struct systemone {
             ggml_free(ctx_l);
             throw std::runtime_error("layer readout: compute failed");
         }
-        std::vector<float> logits((const float *) y->data, (const float *) y->data + n_vocab);
+        std::vector<std::vector<float>> logits(n_rows);
+        for (int64_t r = 0; r < n_rows; r++) {
+            const float * row = (const float *) ((const char *) y->data + r * y->nb[1]);
+            logits[r].assign(row, row + n_vocab);
+        }
         ggml_free(ctx_l);
         return logits;
     }
@@ -330,19 +343,33 @@ struct systemone {
         return h;
     }
 
-    // the label logits a layer's residual would give through the output head: RMS norm, then the matrix rows
-    std::vector<float> lens_scores(const std::vector<float> & resid, const std::vector<llama_token> & labels) {
-        const size_t n = resid.size();
-        const std::vector<float> h = lens_norm(resid.data(), n);
-        const std::vector<float> logits = lens_logits(h);
-        std::vector<float> scores;
-        for (const llama_token label : labels) {
-            if (label < 0 || (size_t) label >= logits.size()) {
-                throw std::runtime_error("label token out of the vocabulary");
+    // the label logits every layer's residual would give through the output head: the norm, then the matrix,
+    // all layers in one matmul. Empty residuals give empty rows.
+    std::vector<std::vector<float>> lens_scores_all(const std::vector<std::vector<float>> & resids, const std::vector<llama_token> & labels) {
+        std::vector<std::vector<float>> hs;
+        std::vector<size_t> which;
+        for (size_t il = 0; il < resids.size(); il++) {
+            if (!resids[il].empty()) {
+                hs.push_back(lens_norm(resids[il].data(), resids[il].size()));
+                which.push_back(il);
             }
-            scores.push_back(logits[label]);
         }
-        return scores;
+        std::vector<std::vector<float>> out(resids.size());
+        if (hs.empty()) {
+            return out;
+        }
+        const auto logits = lens_logits(hs);
+        for (size_t k = 0; k < which.size(); k++) {
+            std::vector<float> scores;
+            for (const llama_token label : labels) {
+                if (label < 0 || (size_t) label >= logits[k].size()) {
+                    throw std::runtime_error("label token out of the vocabulary");
+                }
+                scores.push_back(logits[k][label]);
+            }
+            out[which[k]] = std::move(scores);
+        }
+        return out;
     }
 
     // what the per-token capture of one task turns into
@@ -573,6 +600,7 @@ struct systemone {
             const auto t_readout = std::chrono::steady_clock::now();
             layers->clear();
             const int n_layer_enc = (int) llama_model_n_layer(model) - (int) model->hparams.n_layer_decision;
+            const auto label_scores = lens_labels ? lens_scores_all(lens_resid, d.labels) : std::vector<std::vector<float>>();
             for (size_t il = 0; il < lens_resid.size(); il++) {
                 const auto & resid = lens_resid[il];
                 if (lens_head) {
@@ -586,7 +614,7 @@ struct systemone {
                 } else if (resid.empty()) {
                     layers->push_back({});
                 } else if (lens_labels) {
-                    layers->push_back(pool_groups(lens_scores(resid, d.labels), d.label_groups));
+                    layers->push_back(pool_groups(label_scores[il], d.label_groups));
                 } else {
                     // markers: the embedding column of each option, as send_decision() reads it from the final embeddings
                     const size_t n_embd = resid.size() / lens_pos.size();
